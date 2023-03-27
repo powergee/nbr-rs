@@ -1,15 +1,16 @@
-use std::{ptr::{self, NonNull}, sync::atomic::{compiler_fence, Ordering}};
+use core::{
+    ptr::{self, NonNull},
+    sync::atomic::{compiler_fence, Ordering},
+};
 
 pub(crate) struct BlockBag {
-    owner: usize,
     size_in_blocks: usize,
     head: NonNull<Block>,
-    tail: *mut Block,
     pool: NonNull<BlockPool>,
 }
 
 impl BlockBag {
-    fn size_in_blocks(&self) -> usize {
+    pub fn size_in_blocks(&self) -> usize {
         let mut result = 0;
         let mut curr = self.head.as_ptr();
         while let Some(curr_ref) = unsafe { curr.as_ref() } {
@@ -25,21 +26,24 @@ impl BlockBag {
         head.next.is_null() && head.is_empty()
     }
 
-    pub fn new(tid: usize, mut pool: NonNull<BlockPool>) -> Self {
+    pub fn new(mut pool: NonNull<BlockPool>) -> Self {
         let head = unsafe { pool.as_mut() }.allocate(ptr::null_mut());
-        let tail = head.as_ptr();
         Self {
-            owner: tid,
             size_in_blocks: 1,
             head,
-            tail,
             pool,
         }
     }
 
+    #[inline]
     pub fn add<T>(&mut self, obj: NonNull<T>) {
+        self.add_retired(Retired::new(obj.as_ptr()));
+    }
+
+    #[inline]
+    pub fn add_retired(&mut self, ret: Retired) {
         let head_ref = unsafe { self.head.as_mut() };
-        head_ref.push(obj);
+        head_ref.push_retired(ret);
         if head_ref.is_full() {
             let new_head = unsafe { self.pool.as_mut() }.allocate(self.head.as_ptr());
             self.size_in_blocks += 1;
@@ -48,7 +52,7 @@ impl BlockBag {
         }
     }
 
-    pub fn remove<T>(&mut self) -> Retired {
+    pub fn remove(&mut self) -> Retired {
         assert!(!self.is_empty());
         unsafe {
             let head_ref = self.head.as_mut();
@@ -63,6 +67,14 @@ impl BlockBag {
                 result = head_ref.pop();
             }
             result
+        }
+    }
+
+    pub fn first_non_empty_block(&self) -> Option<NonNull<Block>> {
+        if self.is_empty() {
+            None
+        } else {
+            Some(self.head)
         }
     }
 }
@@ -138,8 +150,8 @@ impl BlockPool {
 //
 // For our implementation, Block::data also holds deleters for each record,
 // so BLOCK_SIZE_DESIRED_BYTES must be divided by 16.
-const BLOCK_SIZE_DESIRED_BYTES: usize = 512;
-const BLOCK_SIZE: usize = BLOCK_SIZE_DESIRED_BYTES / 16 - 2;
+pub(crate) const BLOCK_SIZE_DESIRED_BYTES: usize = 512;
+pub(crate) const BLOCK_SIZE: usize = BLOCK_SIZE_DESIRED_BYTES / 16 - 2;
 
 pub(crate) struct Block {
     next: *mut Block,
@@ -167,10 +179,10 @@ impl Block {
     }
 
     #[inline]
-    pub fn push<T>(&mut self, obj: NonNull<T>) {
+    pub fn push_retired(&mut self, ret: Retired) {
         assert!(self.size < BLOCK_SIZE);
         let prev_size = self.size;
-        self.data[prev_size] = Retired::new(obj.as_ptr());
+        self.data[prev_size] = ret;
         compiler_fence(Ordering::SeqCst);
         self.size = prev_size + 1;
     }
@@ -182,47 +194,6 @@ impl Block {
         self.size -= 1;
         // Used `new` instead of `new_unchecked` for debug
         ret
-    }
-
-    /// Linear time, however constant time to remove the last object
-    #[inline]
-    pub fn erase<T>(&mut self, obj: *mut T) {
-        if self.size == 0 {
-            return;
-        }
-
-        // A shortcut to remove the last object
-        if self.data[self.size - 1].ptr == obj as _ {
-            self.size -= 1;
-            return;
-        }
-
-        for i in 0..self.size-1 {
-            if self.data[i].ptr == obj as _ {
-                self.data[i] = self.data[self.size - 1];
-                compiler_fence(Ordering::SeqCst);
-                self.size -= 1;
-                return;
-            }
-        }
-    }
-
-    #[inline]
-    pub fn replace<T>(&mut self, ix: usize, obj: NonNull<T>) {
-        assert!(ix < self.size);
-        self.data[ix] = Retired::new(obj.as_ptr());
-    }
-
-    #[inline]
-    pub fn size(&self) -> usize {
-        self.size
-    }
-
-    #[inline]
-    pub fn clear_without_freeing(&mut self) {
-        compiler_fence(Ordering::SeqCst);
-        self.size = 0;
-        compiler_fence(Ordering::SeqCst);
     }
 }
 
@@ -240,7 +211,10 @@ pub(crate) struct Retired {
 
 impl Default for Retired {
     fn default() -> Self {
-        Self { ptr: ptr::null_mut(), deleter: free::<u8> }
+        Self {
+            ptr: ptr::null_mut(),
+            deleter: free::<u8>,
+        }
     }
 }
 
@@ -248,8 +222,16 @@ impl Retired {
     fn new<T>(ptr: *mut T) -> Self {
         Self {
             ptr: ptr as *mut u8,
-            deleter: free::<T>
+            deleter: free::<T>,
         }
+    }
+
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub unsafe fn deallocate(self) {
+        (self.deleter)(self.ptr);
     }
 }
 
