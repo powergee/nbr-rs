@@ -1,21 +1,16 @@
 #[macro_export]
-/// Ok or executing the given expression.
-macro_rules! ok_or {
-    ($e:expr, $err:expr) => {{
-        match $e {
-            Ok(r) => r,
-            Err(_) => $err,
-        }
-    }};
-}
+/// Automate starting, ending, protecting and barriering for read phase.
+macro_rules! read_phase {
+    ($guard:expr; $($record:expr),*; $($t:tt)*) => {
+        ($guard).start_read();
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 
-#[macro_export]
-/// Some or executing the given expression.
-macro_rules! some_or {
-    ($e:expr, $err:expr) => {{
-        match $e {
-            Some(r) => r,
-            None => $err,
-        }
-    }};
+        { $($t)* }
+
+        $(
+            ($guard).protect($record);
+        )*
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        ($guard).end_read();
+    };
 }

@@ -1,7 +1,7 @@
-use nbr_rs::{some_or, Guard};
+use nbr_rs::{read_phase, Guard};
 use std::cmp::Ordering::{Equal, Greater, Less};
 /// Test with Harris List
-use std::sync::atomic::{compiler_fence, fence, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::{mem, ptr};
 
 /// Returns a bitmask containing the unused least significant bits of an aligned pointer to `T`.
@@ -37,6 +37,16 @@ pub fn untagged<T>(ptr: *mut T) -> *mut T {
 pub fn tag<T>(ptr: *mut T) -> usize {
     let ptr = ptr as usize;
     ptr & low_bits::<T>()
+}
+
+/// Some or executing the given expression.
+macro_rules! some_or {
+    ($e:expr, $err:expr) => {{
+        match $e {
+            Some(r) => r,
+            None => $err,
+        }
+    }};
 }
 
 #[derive(Debug)]
@@ -101,36 +111,31 @@ where
         let mut prev_next;
 
         'search_loop: loop {
-            guard.start_read();
-            compiler_fence(Ordering::SeqCst);
-            cursor.prev = &self.head as *const _ as *mut Node<K, V>;
-            cursor.curr = self.head.load(Ordering::Acquire);
-            prev_next = cursor.curr;
+            read_phase!(guard; untagged(cursor.prev), untagged(cursor.curr); {
+                cursor.prev = &self.head as *const _ as *mut Node<K, V>;
+                cursor.curr = self.head.load(Ordering::Acquire);
+                prev_next = cursor.curr;
 
-            cursor.found = loop {
-                let curr_node = some_or!(unsafe { untagged(cursor.curr).as_ref() }, break false);
-                let next = curr_node.next.load(Ordering::Acquire);
+                cursor.found = loop {
+                    let curr_node = some_or!(unsafe { untagged(cursor.curr).as_ref() }, break false);
+                    let next = curr_node.next.load(Ordering::Acquire);
 
-                if tag(next) != 0 {
-                    cursor.curr = tagged(next, 0);
-                    continue;
-                }
-
-                match curr_node.key.cmp(key) {
-                    Less => {
-                        cursor.prev = cursor.curr;
-                        cursor.curr = next;
-                        prev_next = next;
+                    if tag(next) != 0 {
+                        cursor.curr = tagged(next, 0);
+                        continue;
                     }
-                    Equal => break true,
-                    Greater => break false,
-                }
-            };
 
-            guard.protect(untagged(cursor.prev));
-            guard.protect(untagged(cursor.curr));
-            fence(Ordering::SeqCst);
-            guard.end_read();
+                    match curr_node.key.cmp(key) {
+                        Less => {
+                            cursor.prev = cursor.curr;
+                            cursor.curr = next;
+                            prev_next = next;
+                        }
+                        Equal => break true,
+                        Greater => break false,
+                    }
+                };
+            });
 
             if prev_next == cursor.curr {
                 return cursor;
