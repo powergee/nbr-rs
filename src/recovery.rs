@@ -69,9 +69,9 @@ pub(crate) fn set_restartable(set_rest: bool) {
 /// than SIGUSR1 for a neutralize signal.
 /// Note that it must called before creating
 /// a Collector object.
-/// 
+///
 /// # Safety
-/// 
+///
 /// This function accesses and modify static variable.
 /// To avoid potential race conditions, do not
 /// call this function concurrently.
