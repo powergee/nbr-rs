@@ -1,19 +1,17 @@
 /// A concurrent garbage collector
 /// with Neutralization Based Reclamation (NBR+).
-use nix::sys::pthread::{pthread_self, Pthread};
+use nix::sys::pthread::pthread_self;
+use std::sync::atomic::AtomicU64;
 use std::sync::Barrier;
 use std::{
-    cell::{Cell, RefCell},
+    cell::RefCell,
     collections::HashSet,
-    ptr::{null_mut, NonNull},
+    ptr::null_mut,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
+use crate::block_bag::{Block, BlockBag, BlockPool, BLOCK_SIZE};
 use crate::recovery;
-use crate::{
-    block_bag::{Block, BlockBag, BlockPool, BLOCK_SIZE},
-    some_or,
-};
 
 const OPS_BEFORE_TRYRECLAIM_LOWATERMARK: usize = 16000;
 const MAX_RINGBAG_CAPACITY_POW2: usize = 32768;
@@ -50,13 +48,13 @@ struct Thread {
     // Also note that `retired` is declared before `pool`,
     // and it makes sure that `retired` is dropped before
     // dropping `pool`.
-    pool: NonNull<BlockPool>,
+    pool: *mut BlockPool,
     temp_patience: usize,
 
     // Used for NBR+ signal optimization
     announced_ts: AtomicUsize,
     saved_ts: Vec<usize>,
-    saved_block_head: Option<NonNull<Block>>,
+    saved_block_head: *mut Block,
     first_lo_entry_flag: bool,
     retires_since_lo_watermark: usize,
 }
@@ -87,12 +85,12 @@ impl Thread {
 
     #[inline]
     fn send_freeable_to_pool(&mut self) {
-        if let Some(saved_block) = self.saved_block_head {
+        if !self.saved_block_head.is_null() {
             // Reclaim due to a lo-watermark path
             let mut spare_bag = BlockBag::new(self.pool);
 
             while !self.retired.is_empty()
-                && self.retired.first_non_empty_block().unwrap() != saved_block
+                && self.retired.first_non_empty_block() != self.saved_block_head
             {
                 let ret = self.retired.remove();
                 spare_bag.add_retired(ret);
@@ -135,7 +133,7 @@ pub struct Collector {
     threads: Vec<Thread>,
     // Map from Thread ID into pthread_t(u64)
     // for each registered thread
-    registered_map: Vec<Cell<Pthread>>,
+    registered_map: Vec<AtomicU64>,
     registered_count: AtomicUsize,
     barrier: Barrier,
 }
@@ -147,7 +145,7 @@ impl Collector {
         let threads = (0..num_threads)
             .map(|tid| {
                 let pool = Box::<BlockPool>::default();
-                let pool = unsafe { NonNull::new_unchecked(Box::into_raw(pool)) };
+                let pool = Box::into_raw(pool);
                 let retired = BlockBag::new(pool);
                 let proposed_hazptrs = (0..max_hazptr_per_thred)
                     .map(|_| AtomicPtr::new(null_mut()))
@@ -155,7 +153,6 @@ impl Collector {
                 let scanned_hazptrs = RefCell::default();
                 let announced_ts = AtomicUsize::new(0);
                 let saved_ts = vec![0; num_threads];
-                let saved_block_head = None;
                 let temp_patience = MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE;
 
                 Thread {
@@ -168,7 +165,7 @@ impl Collector {
                     temp_patience,
                     announced_ts,
                     saved_ts,
-                    saved_block_head,
+                    saved_block_head: null_mut(),
                     first_lo_entry_flag: true,
                     retires_since_lo_watermark: 0,
                 }
@@ -178,7 +175,7 @@ impl Collector {
         Self {
             num_threads,
             threads,
-            registered_map: vec![Cell::new(0); num_threads],
+            registered_map: (0..num_threads).map(|_| AtomicU64::new(0)).collect(),
             registered_count: AtomicUsize::new(0),
             barrier: Barrier::new(num_threads),
         }
@@ -190,7 +187,7 @@ impl Collector {
             if other_tid == reclaimer {
                 continue;
             }
-            let pthread = self.registered_map[other_tid].get();
+            let pthread = self.registered_map[other_tid].load(Ordering::Acquire);
             if let Err(err) = recovery::send_signal(pthread) {
                 panic!("Failed to restart other threads: {err}");
             }
@@ -228,11 +225,16 @@ impl Collector {
             tid < self.num_threads,
             "Attempted to exceed the maximum number of threads"
         );
-        self.registered_map[tid].replace(pthread_self());
+        self.registered_map[tid].store(pthread_self(), Ordering::Release);
 
         // Wait until all threads are ready.
         self.barrier.wait();
         Guard::register(self, tid)
+    }
+
+    pub fn reset_registrations(&mut self) {
+        self.registered_count.store(0, Ordering::SeqCst);
+        self.barrier = Barrier::new(self.num_threads);
     }
 }
 
@@ -246,6 +248,9 @@ impl Drop for Collector {
         }
     }
 }
+
+unsafe impl Send for Collector {}
+unsafe impl Sync for Collector {}
 
 pub struct Guard {
     collector: *mut Collector,
@@ -315,13 +320,13 @@ impl Guard {
 
     /// Prevent other threads from deleting the record.
     #[inline]
-    pub fn protect(&self, ptr: *mut u8) {
+    pub fn protect<T>(&self, ptr: *mut T) {
         let thread = self.thread_mut();
         let hazptr_len = thread.proposed_len.load(Ordering::Acquire);
         if hazptr_len == thread.proposed_hazptrs.len() {
             panic!("The hazard pointer bag is already full.");
         }
-        thread.proposed_hazptrs[hazptr_len].store(ptr, Ordering::Release);
+        thread.proposed_hazptrs[hazptr_len].store(ptr as *mut _, Ordering::Release);
         thread.proposed_len.store(hazptr_len + 1, Ordering::Release);
     }
 
@@ -334,7 +339,7 @@ impl Guard {
     }
 
     #[inline]
-    pub fn retire<T>(&self, ptr: *mut T) {
+    pub unsafe fn retire<T>(&self, ptr: *mut T) {
         let collector = self.coll_mut();
         let num_threads = collector.num_threads;
 
@@ -344,7 +349,7 @@ impl Guard {
                 .announced_ts
                 .fetch_add(1, Ordering::SeqCst);
 
-            unsafe { collector.restart_all_threads(self.tid) };
+            collector.restart_all_threads(self.tid);
             // Tell other threads that I have done signaling.
             self.thread_mut()
                 .announced_ts
@@ -352,7 +357,7 @@ impl Guard {
 
             // Full bag shall be reclaimed so clear any bag head.
             // Avoiding changes to arg of this reclaim_freeable.
-            self.thread_mut().saved_block_head = None;
+            self.thread_mut().saved_block_head = null_mut();
             collector.reclaim_freeable(self.tid);
 
             self.thread_mut().first_lo_entry_flag = true;
@@ -401,10 +406,6 @@ impl Guard {
             self.thread_mut().retires_since_lo_watermark += 1;
         }
 
-        let ptr = some_or!(
-            NonNull::new(ptr),
-            panic!("A pointer to be retired must be non-null.")
-        );
         self.thread_mut().retired.add(ptr);
     }
 }

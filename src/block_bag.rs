@@ -1,18 +1,18 @@
 use core::{
-    ptr::{self, NonNull},
+    ptr,
     sync::atomic::{compiler_fence, Ordering},
 };
 
 pub(crate) struct BlockBag {
     size_in_blocks: usize,
-    head: NonNull<Block>,
-    pool: NonNull<BlockPool>,
+    head: *mut Block,
+    pool: *mut BlockPool,
 }
 
 impl BlockBag {
     pub fn size_in_blocks(&self) -> usize {
         let mut result = 0;
-        let mut curr = self.head.as_ptr();
+        let mut curr = self.head;
         while let Some(curr_ref) = unsafe { curr.as_ref() } {
             result += 1;
             curr = curr_ref.next;
@@ -22,12 +22,12 @@ impl BlockBag {
 
     #[inline]
     pub fn is_empty(&self) -> bool {
-        let head = unsafe { self.head.as_ref() };
+        let head = unsafe { self.head.as_ref().unwrap() };
         head.next.is_null() && head.is_empty()
     }
 
-    pub fn new(mut pool: NonNull<BlockPool>) -> Self {
-        let head = unsafe { pool.as_mut() }.allocate(ptr::null_mut());
+    pub fn new(mut pool: *mut BlockPool) -> Self {
+        let head = unsafe { pool.as_mut().unwrap() }.allocate(ptr::null_mut());
         Self {
             size_in_blocks: 1,
             head,
@@ -36,16 +36,16 @@ impl BlockBag {
     }
 
     #[inline]
-    pub fn add<T>(&mut self, obj: NonNull<T>) {
-        self.add_retired(Retired::new(obj.as_ptr()));
+    pub fn add<T>(&mut self, obj: *mut T) {
+        self.add_retired(Retired::new(obj));
     }
 
     #[inline]
     pub fn add_retired(&mut self, ret: Retired) {
-        let head_ref = unsafe { self.head.as_mut() };
+        let head_ref = unsafe { self.head.as_mut().unwrap() };
         head_ref.push_retired(ret);
         if head_ref.is_full() {
-            let new_head = unsafe { self.pool.as_mut() }.allocate(self.head.as_ptr());
+            let new_head = unsafe { self.pool.as_mut().unwrap() }.allocate(self.head);
             self.size_in_blocks += 1;
             compiler_fence(Ordering::SeqCst);
             self.head = new_head;
@@ -55,13 +55,13 @@ impl BlockBag {
     pub fn remove(&mut self) -> Retired {
         assert!(!self.is_empty());
         unsafe {
-            let head_ref = self.head.as_mut();
+            let head_ref = self.head.as_mut().unwrap();
             let result;
             if head_ref.is_empty() {
                 result = (*head_ref.next).pop();
                 let block = self.head;
-                self.head = NonNull::new_unchecked(head_ref.next);
-                self.pool.as_mut().try_recycle(block);
+                self.head = head_ref.next;
+                self.pool.as_mut().unwrap().try_recycle(block);
                 self.size_in_blocks -= 1;
             } else {
                 result = head_ref.pop();
@@ -70,11 +70,11 @@ impl BlockBag {
         }
     }
 
-    pub fn first_non_empty_block(&self) -> Option<NonNull<Block>> {
+    pub fn first_non_empty_block(&self) -> *mut Block {
         if self.is_empty() {
-            None
+            ptr::null_mut()
         } else {
-            Some(self.head)
+            self.head
         }
     }
 }
@@ -82,10 +82,10 @@ impl BlockBag {
 impl Drop for BlockBag {
     fn drop(&mut self) {
         assert!(self.is_empty());
-        let mut curr = self.head.as_ptr();
+        let mut curr = self.head;
         unsafe {
             while let Some(curr_ref) = curr.as_ref() {
-                self.pool.as_mut().try_recycle(NonNull::new_unchecked(curr));
+                self.pool.as_mut().unwrap().try_recycle(curr);
                 curr = curr_ref.next;
             }
         }
@@ -119,25 +119,25 @@ impl Drop for BlockPool {
 }
 
 impl BlockPool {
-    pub fn allocate(&mut self, next: *mut Block) -> NonNull<Block> {
+    pub fn allocate(&mut self, next: *mut Block) -> *mut Block {
         unsafe {
             // If there is an available block, reuse it.
             if self.size > 0 {
                 let result = self.pool[self.size - 1];
                 self.size -= 1;
                 *result = Block::new(next);
-                NonNull::new_unchecked(result)
+                result
             } else {
-                NonNull::new_unchecked(Box::into_raw(Box::new(Block::new(next))))
+                Box::into_raw(Box::new(Block::new(next)))
             }
         }
     }
 
-    pub fn try_recycle(&mut self, block: NonNull<Block>) {
+    pub fn try_recycle(&mut self, block: *mut Block) {
         if self.size == MAX_BLOCK_POOL_SIZE {
-            drop(unsafe { Box::from_raw(block.as_ptr()) });
+            drop(unsafe { Box::from_raw(block) });
         } else {
-            self.pool[self.size] = block.as_ptr();
+            self.pool[self.size] = block;
             self.size += 1;
         }
     }

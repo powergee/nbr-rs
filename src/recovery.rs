@@ -7,14 +7,14 @@ use nix::sys::signal::{
 use setjmp::{sigjmp_buf, siglongjmp, sigsetjmp};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{compiler_fence, fence, Ordering};
+use std::sync::atomic::{compiler_fence, fence, AtomicBool, Ordering};
 
 static mut NEUTRALIZE_SIGNAL: Signal = Signal::SIGUSR1;
 static mut SIG_ACTION: MaybeUninit<SigAction> = MaybeUninit::uninit();
 
 thread_local! {
     static JMP_BUF: RefCell<MaybeUninit<sigjmp_buf>> = RefCell::new(MaybeUninit::uninit());
-    static RESTARTABLE: RefCell<bool> = RefCell::new(false);
+    static RESTARTABLE: RefCell<AtomicBool> = RefCell::new(AtomicBool::new(false));
 }
 
 /// Install a process-wide signal handler.
@@ -56,12 +56,12 @@ pub(crate) unsafe fn set_checkpoint() {
 
 #[inline]
 pub(crate) fn is_restartable() -> bool {
-    RESTARTABLE.with(|rest| *rest.borrow())
+    RESTARTABLE.with(|rest| rest.borrow().load(Ordering::Acquire))
 }
 
 #[inline]
 pub(crate) fn set_restartable(set_rest: bool) {
-    RESTARTABLE.with(|rest| *rest.borrow_mut() = set_rest);
+    RESTARTABLE.with(|rest| rest.borrow().store(set_rest, Ordering::Release));
 }
 
 /// Set user-defined neutralize signal.
