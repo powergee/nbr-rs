@@ -26,7 +26,7 @@ impl BlockBag {
         head.next.is_null() && head.is_empty()
     }
 
-    pub fn new(mut pool: *mut BlockPool) -> Self {
+    pub fn new(pool: *mut BlockPool) -> Self {
         let head = unsafe { pool.as_mut().unwrap() }.allocate(ptr::null_mut());
         Self {
             size_in_blocks: 1,

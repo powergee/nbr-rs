@@ -338,6 +338,14 @@ impl Guard {
         recovery::set_restartable(false);
     }
 
+    /// Retire a pointer.
+    /// It may trigger other threads to restart.
+    /// 
+    /// # Safety
+    /// * The given memory block is no longer modified.
+    /// * It is no longer possible to reach the block from
+    ///   the data structure.
+    /// * The same block is not retired more than once.
     #[inline]
     pub unsafe fn retire<T>(&self, ptr: *mut T) {
         let collector = self.coll_mut();
