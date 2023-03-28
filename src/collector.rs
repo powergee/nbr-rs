@@ -303,13 +303,8 @@ impl Guard {
     /// as part of the read phase of some operation on the shared data
     /// structure. If the thread is neutralized in middle of its update
     /// to this local list, it might corrupt the structure of the list.
-    #[inline]
+    #[inline(never)]
     pub fn start_read(&self) {
-        // `sigsetjmp` must called first. (in `set_checkpoint()`)
-        // Since, if `sigsetjmp` is done later than other jobs
-        // in `start_read`, the restartable would never be set to 1
-        // and the upgrade assert will fail.
-        unsafe { recovery::set_checkpoint() };
         let thread = &mut self.coll_mut().threads[self.tid];
         assert!(
             !recovery::is_restartable(),
@@ -417,5 +412,55 @@ impl Guard {
         }
 
         self.thread_mut().retired_mut().push(ptr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Collector;
+    use crate::{read_phase, recovery::is_restartable};
+    use crossbeam_utils::thread;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
+
+    const THREADS: usize = 2;
+
+    #[test]
+    fn restart_all() {
+        let collector = Arc::new(Collector::new(THREADS + 1, 1));
+        let started = Arc::new(AtomicUsize::new(0));
+
+        thread::scope(|s| {
+            for _ in 0..THREADS {
+                let collector = Arc::clone(&collector);
+                let started = Arc::clone(&started);
+
+                s.spawn(move |_| {
+                    let guard = collector.register();
+                    assert!(!is_restartable());
+
+                    read_phase!(guard; [] => {
+                        if started.fetch_add(1, Ordering::SeqCst) < THREADS {
+                            assert!(is_restartable());
+                            loop {
+                                std::thread::sleep(Duration::from_micros(1))
+                            }
+                        }
+                    });
+                });
+            }
+
+            let guard = collector.register();
+            while started.load(Ordering::SeqCst) < THREADS {
+                std::thread::sleep(Duration::from_micros(1));
+            }
+            unsafe { collector.restart_all_threads(guard.tid) };
+        })
+        .unwrap();
     }
 }

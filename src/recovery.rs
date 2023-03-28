@@ -1,13 +1,11 @@
 /// A thread-local recovery manager with signal handling
 use nix::libc::{c_void, siginfo_t};
 use nix::sys::pthread::{pthread_kill, Pthread};
-use nix::sys::signal::{
-    pthread_sigmask, sigaction, SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, Signal,
-};
-use setjmp::{sigjmp_buf, siglongjmp, sigsetjmp};
+use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
+use setjmp::{sigjmp_buf, siglongjmp};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{compiler_fence, fence, AtomicBool, Ordering};
+use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 static mut NEUTRALIZE_SIGNAL: Signal = Signal::SIGUSR1;
 static mut SIG_ACTION: MaybeUninit<SigAction> = MaybeUninit::uninit();
@@ -43,18 +41,6 @@ pub(crate) unsafe fn send_signal(pthread: Pthread) -> nix::Result<()> {
 }
 
 #[inline]
-pub(crate) unsafe fn set_checkpoint() {
-    while unsafe { sigsetjmp(JMP_BUF.with(|buf| buf.borrow_mut().as_mut_ptr()), 0) } == 1 {
-        fence(Ordering::SeqCst);
-        let mut oldset = SigSet::empty();
-        oldset.add(NEUTRALIZE_SIGNAL);
-        if pthread_sigmask(SigmaskHow::SIG_UNBLOCK, Some(&oldset), None).is_err() {
-            panic!("Failed to unblock signal");
-        }
-    }
-}
-
-#[inline]
 pub(crate) fn is_restartable() -> bool {
     RESTARTABLE.with(|rest| rest.borrow().load(Ordering::Acquire))
 }
@@ -62,6 +48,20 @@ pub(crate) fn is_restartable() -> bool {
 #[inline]
 pub(crate) fn set_restartable(set_rest: bool) {
     RESTARTABLE.with(|rest| rest.borrow().store(set_rest, Ordering::Release));
+}
+
+/// Get a current neutralize signal.
+///
+/// By default, SIGUSR1 is used as a neutralize signal.
+/// To use the other signal, use `set_neutralize_signal`.
+///
+/// # Safety
+///
+/// This function accesses and modify static variable.
+/// To avoid potential race conditions, do not
+/// call this function concurrently.
+pub unsafe fn neutralize_signal() -> Signal {
+    NEUTRALIZE_SIGNAL
 }
 
 /// Set user-defined neutralize signal.
@@ -75,9 +75,20 @@ pub(crate) fn set_restartable(set_rest: bool) {
 /// This function accesses and modify static variable.
 /// To avoid potential race conditions, do not
 /// call this function concurrently.
-#[inline]
 pub unsafe fn set_neutralize_signal(signal: Signal) {
     NEUTRALIZE_SIGNAL = signal;
+}
+
+/// Get a mutable thread-local pointer to `sigjmp_buf`,
+/// which is used for `sigsetjmp` at the entrance of
+/// read phase.
+///
+/// This function is used for `read_phase` macro and
+/// other internal functions.
+/// It is not recommended to access this manually.
+#[inline]
+pub fn jmp_buf() -> *mut sigjmp_buf {
+    JMP_BUF.with(|buf| buf.borrow_mut().as_mut_ptr())
 }
 
 extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {

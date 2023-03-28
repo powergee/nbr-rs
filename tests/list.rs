@@ -112,7 +112,7 @@ where
         let mut prev_next;
 
         'search_loop: loop {
-            read_phase!(guard; untagged(cursor.prev), untagged(cursor.curr); {
+            read_phase!(guard; [untagged(cursor.prev), untagged(cursor.curr)] => {
                 cursor.prev = &self.head as *const _ as *mut Node<K, V>;
                 cursor.curr = self.head.load(Ordering::Acquire);
                 prev_next = cursor.curr;
