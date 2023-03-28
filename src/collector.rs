@@ -14,7 +14,10 @@ use crate::block_bag::{Block, BlockBag, BlockPool, BLOCK_SIZE};
 use crate::recovery;
 
 const OPS_BEFORE_TRYRECLAIM_LOWATERMARK: usize = 16000;
+#[cfg(not(sanitize = "address"))]
 const MAX_RINGBAG_CAPACITY_POW2: usize = 32768;
+#[cfg(sanitize = "address")]
+const MAX_RINGBAG_CAPACITY_POW2: usize = 8;
 
 /// 0-indexed thread identifier.
 /// Note that this ThreadId is not same with pthread_t,
@@ -25,7 +28,7 @@ pub type ThreadId = usize;
 struct Thread {
     tid: ThreadId,
     // Retired records collected by a delete operation
-    retired: BlockBag,
+    retired: *mut BlockBag,
     // Saves the discovered records before upgrading to write
     // to protect records from concurrent reclaimer threads.
     // (Single-Writer Multi-Reader)
@@ -44,10 +47,6 @@ struct Thread {
     // `pool_interface`, as `pool_interface` is just a simple
     // wrapper for convinient allocating & deallocating.
     // It can be replaced with a simple `BlockPool`.
-    //
-    // Also note that `retired` is declared before `pool`,
-    // and it makes sure that `retired` is dropped before
-    // dropping `pool`.
     pool: *mut BlockPool,
     temp_patience: usize,
 
@@ -60,6 +59,35 @@ struct Thread {
 }
 
 impl Thread {
+    pub fn new(tid: usize, num_threads: usize, max_hazptr_per_thred: usize) -> Self {
+        let pool = Box::into_raw(Box::<BlockPool>::default());
+        let retired = Box::into_raw(Box::new(BlockBag::new(pool)));
+        let proposed_hazptrs = (0..max_hazptr_per_thred)
+            .map(|_| AtomicPtr::new(null_mut()))
+            .collect();
+
+        Self {
+            tid,
+            retired,
+            proposed_len: AtomicUsize::new(0),
+            proposed_hazptrs,
+            scanned_hazptrs: RefCell::default(),
+            pool,
+            temp_patience: MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE,
+            announced_ts: AtomicUsize::new(0),
+            saved_ts: vec![0; num_threads],
+            saved_block_head: null_mut(),
+            first_lo_entry_flag: true,
+            retires_since_lo_watermark: 0,
+        }
+    }
+
+    #[inline(always)]
+    #[allow(clippy::mut_from_ref)]
+    fn retired_mut(&self) -> &mut BlockBag {
+        unsafe { &mut *self.retired }
+    }
+
     // This out of patience decision has been improved
     // in the latest NBR+ version on setbench.
     #[inline]
@@ -68,52 +96,52 @@ impl Thread {
             self.temp_patience = MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE;
         }
 
-        self.retired.size_in_blocks() > self.temp_patience
+        self.retired_mut().size_in_blocks() > self.temp_patience
     }
 
     #[inline]
     fn is_past_lo_watermark(&mut self) -> bool {
-        (self.retired.size_in_blocks() as f32
+        (self.retired_mut().size_in_blocks() as f32
             > (self.temp_patience as f32 * (1.0f32 / ((self.tid % 3) + 2) as f32)))
             && ((self.retires_since_lo_watermark % OPS_BEFORE_TRYRECLAIM_LOWATERMARK) == 0)
     }
 
     #[inline]
     fn set_lo_watermark(&mut self) {
-        self.saved_block_head = self.retired.first_non_empty_block();
+        self.saved_block_head = self.retired_mut().first_non_empty_block();
     }
 
     #[inline]
     fn send_freeable_to_pool(&mut self) {
+        let retired = self.retired_mut();
+
         if !self.saved_block_head.is_null() {
             // Reclaim due to a lo-watermark path
             let mut spare_bag = BlockBag::new(self.pool);
 
-            while !self.retired.is_empty()
-                && self.retired.first_non_empty_block() != self.saved_block_head
-            {
-                let ret = self.retired.remove();
-                spare_bag.add_retired(ret);
+            while !retired.is_empty() && retired.first_non_empty_block() != self.saved_block_head {
+                let ret = retired.pop();
+                spare_bag.push_retired(ret);
             }
 
             // Deallocate blocks and clear the bag.
             // It may not reclaim non full blocks.
-            while !self.retired.is_empty() {
-                let ret = self.retired.remove();
+            while !retired.is_empty() {
+                let ret = retired.pop();
                 unsafe { ret.deallocate() };
             }
 
             while !spare_bag.is_empty() {
-                self.retired.add_retired(spare_bag.remove());
+                retired.push_retired(spare_bag.pop());
             }
         } else {
             // Reclaim due to a hi-watermark path
             let mut spare_bag = BlockBag::new(self.pool);
 
-            while !self.retired.is_empty() {
-                let ret = self.retired.remove();
+            while !retired.is_empty() {
+                let ret = retired.pop();
                 if self.scanned_hazptrs.borrow().contains(&ret.ptr()) {
-                    spare_bag.add_retired(ret);
+                    spare_bag.push_retired(ret);
                 } else {
                     unsafe { ret.deallocate() };
                 }
@@ -121,9 +149,20 @@ impl Thread {
 
             // Add all collected but protected records back to `retired`
             while !spare_bag.is_empty() {
-                let ret = spare_bag.remove();
-                self.retired.add_retired(ret);
+                let ret = spare_bag.pop();
+                retired.push_retired(ret);
             }
+        }
+    }
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        unsafe {
+            let mut retired = Box::from_raw(self.retired);
+            retired.deallocate_all();
+            drop(retired);
+            drop(Box::from_raw(self.pool));
         }
     }
 }
@@ -143,33 +182,7 @@ impl Collector {
         unsafe { recovery::install() };
 
         let threads = (0..num_threads)
-            .map(|tid| {
-                let pool = Box::<BlockPool>::default();
-                let pool = Box::into_raw(pool);
-                let retired = BlockBag::new(pool);
-                let proposed_hazptrs = (0..max_hazptr_per_thred)
-                    .map(|_| AtomicPtr::new(null_mut()))
-                    .collect();
-                let scanned_hazptrs = RefCell::default();
-                let announced_ts = AtomicUsize::new(0);
-                let saved_ts = vec![0; num_threads];
-                let temp_patience = MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE;
-
-                Thread {
-                    tid,
-                    retired,
-                    proposed_len: AtomicUsize::new(0),
-                    proposed_hazptrs,
-                    scanned_hazptrs,
-                    pool,
-                    temp_patience,
-                    announced_ts,
-                    saved_ts,
-                    saved_block_head: null_mut(),
-                    first_lo_entry_flag: true,
-                    retires_since_lo_watermark: 0,
-                }
-            })
+            .map(|tid| Thread::new(tid, num_threads, max_hazptr_per_thred))
             .collect();
 
         Self {
@@ -235,17 +248,6 @@ impl Collector {
     pub fn reset_registrations(&mut self) {
         self.registered_count.store(0, Ordering::SeqCst);
         self.barrier = Barrier::new(self.num_threads);
-    }
-}
-
-impl Drop for Collector {
-    fn drop(&mut self) {
-        for i in 0..self.num_threads {
-            let retired = &mut self.threads[i].retired;
-            while !retired.is_empty() {
-                unsafe { retired.remove().deallocate() };
-            }
-        }
     }
 }
 
@@ -340,7 +342,7 @@ impl Guard {
 
     /// Retire a pointer.
     /// It may trigger other threads to restart.
-    /// 
+    ///
     /// # Safety
     /// * The given memory block is no longer modified.
     /// * It is no longer possible to reach the block from
@@ -414,6 +416,6 @@ impl Guard {
             self.thread_mut().retires_since_lo_watermark += 1;
         }
 
-        self.thread_mut().retired.add(ptr);
+        self.thread_mut().retired_mut().push(ptr);
     }
 }

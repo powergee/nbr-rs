@@ -1,7 +1,8 @@
+#![feature(strict_provenance_atomic_ptr)]
+
 use nbr_rs::{read_phase, Guard};
 use std::cmp::Ordering::{Equal, Greater, Less};
-/// Test with Harris List
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, Ordering};
 use std::{mem, ptr};
 
 /// Returns a bitmask containing the unused least significant bits of an aligned pointer to `T`.
@@ -67,7 +68,7 @@ impl<K, V> Drop for List<K, V> {
 
             while let Some(curr_ref) = untagged(curr).as_ref() {
                 let next = curr_ref.next.load(Ordering::Relaxed);
-                drop(Box::from_raw(curr));
+                drop(Box::from_raw(untagged(curr)));
                 curr = next;
             }
         }
@@ -153,7 +154,7 @@ where
             let mut node = prev_next;
             while tagged(node, 0) != cursor.curr {
                 let next = unsafe { &*untagged(node) }.next.load(Ordering::Acquire);
-                unsafe { guard.retire(next) };
+                unsafe { guard.retire(untagged(node)) };
                 node = next;
             }
 
@@ -201,9 +202,7 @@ where
             }
 
             let curr_node = unsafe { &*cursor.curr };
-            let next_ptr = unsafe { &*(&curr_node.next as *const _ as *mut AtomicUsize) };
-            let next =
-                next_ptr.fetch_or(1, Ordering::Acquire) as *const Node<K, V> as *mut Node<K, V>;
+            let next = curr_node.next.fetch_or(1, Ordering::Acquire);
             if tag(next) == 1 {
                 continue;
             }
@@ -221,6 +220,7 @@ where
     }
 }
 
+/// Test with Harris List
 #[cfg(test)]
 mod tests {
     use super::List;

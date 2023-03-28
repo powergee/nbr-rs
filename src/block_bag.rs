@@ -36,12 +36,12 @@ impl BlockBag {
     }
 
     #[inline]
-    pub fn add<T>(&mut self, obj: *mut T) {
-        self.add_retired(Retired::new(obj));
+    pub fn push<T>(&mut self, obj: *mut T) {
+        self.push_retired(Retired::new(obj));
     }
 
     #[inline]
-    pub fn add_retired(&mut self, ret: Retired) {
+    pub fn push_retired(&mut self, ret: Retired) {
         let head_ref = unsafe { self.head.as_mut().unwrap() };
         head_ref.push_retired(ret);
         if head_ref.is_full() {
@@ -52,7 +52,7 @@ impl BlockBag {
         }
     }
 
-    pub fn remove(&mut self) -> Retired {
+    pub fn pop(&mut self) -> Retired {
         assert!(!self.is_empty());
         unsafe {
             let head_ref = self.head.as_mut().unwrap();
@@ -70,6 +70,12 @@ impl BlockBag {
         }
     }
 
+    pub fn deallocate_all(&mut self) {
+        while !self.is_empty() {
+            unsafe { self.pop().deallocate() };
+        }
+    }
+
     pub fn first_non_empty_block(&self) -> *mut Block {
         if self.is_empty() {
             ptr::null_mut()
@@ -81,12 +87,12 @@ impl BlockBag {
 
 impl Drop for BlockBag {
     fn drop(&mut self) {
-        assert!(self.is_empty());
         let mut curr = self.head;
         unsafe {
             while let Some(curr_ref) = curr.as_ref() {
+                let next = curr_ref.next;
                 self.pool.as_mut().unwrap().try_recycle(curr);
-                curr = curr_ref.next;
+                curr = next;
             }
         }
     }
@@ -150,7 +156,11 @@ impl BlockPool {
 //
 // For our implementation, Block::data also holds deleters for each record,
 // so BLOCK_SIZE_DESIRED_BYTES must be divided by 16.
+#[cfg(not(sanitize = "address"))]
 pub(crate) const BLOCK_SIZE_DESIRED_BYTES: usize = 512;
+#[cfg(sanitize = "address")]
+pub(crate) const BLOCK_SIZE_DESIRED_BYTES: usize = 64;
+
 pub(crate) const BLOCK_SIZE: usize = BLOCK_SIZE_DESIRED_BYTES / 16 - 2;
 
 pub(crate) struct Block {

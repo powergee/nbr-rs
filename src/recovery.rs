@@ -1,4 +1,4 @@
-/// A low-level recovery manager with signal handling
+/// A thread-local recovery manager with signal handling
 use nix::libc::{c_void, siginfo_t};
 use nix::sys::pthread::{pthread_kill, Pthread};
 use nix::sys::signal::{
@@ -21,7 +21,7 @@ thread_local! {
 /// Note that we don't have to call `sigaction` for every child thread.
 ///
 /// By default, SIGUSR1 is used as a neutralize signal.
-/// To use the other signal, call `set_neutralize_signal`.
+/// To use the other signal, use `set_neutralize_signal`.
 #[inline]
 pub(crate) unsafe fn install() {
     let sig_action = SigAction::new(

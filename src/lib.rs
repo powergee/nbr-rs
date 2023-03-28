@@ -1,3 +1,4 @@
+#![feature(cfg_sanitize)]
 mod block_bag;
 mod collector;
 mod recovery;
