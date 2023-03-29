@@ -12,7 +12,7 @@ static mut SIG_ACTION: MaybeUninit<SigAction> = MaybeUninit::uninit();
 
 thread_local! {
     static JMP_BUF: RefCell<MaybeUninit<sigjmp_buf>> = RefCell::new(MaybeUninit::uninit());
-    static RESTARTABLE: RefCell<AtomicBool> = RefCell::new(AtomicBool::new(false));
+    static RESTARTABLE: AtomicBool = AtomicBool::new(false);
 }
 
 /// Install a process-wide signal handler.
@@ -42,12 +42,12 @@ pub(crate) unsafe fn send_signal(pthread: Pthread) -> nix::Result<()> {
 
 #[inline]
 pub(crate) fn is_restartable() -> bool {
-    RESTARTABLE.with(|rest| rest.borrow().load(Ordering::Acquire))
+    RESTARTABLE.with(|rest| rest.load(Ordering::Acquire))
 }
 
 #[inline]
 pub(crate) fn set_restartable(set_rest: bool) {
-    RESTARTABLE.with(|rest| rest.borrow().store(set_rest, Ordering::Release));
+    RESTARTABLE.with(|rest| rest.store(set_rest, Ordering::Release));
 }
 
 /// Get a current neutralize signal.
