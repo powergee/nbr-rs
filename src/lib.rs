@@ -3,7 +3,7 @@ mod block_bag;
 mod collector;
 pub mod recovery;
 
-pub use collector::{Collector, Guard, ThreadId};
+pub use collector::{Collector, Guard, ThreadId, unprotected};
 
 pub use nix::sys::signal;
 pub use setjmp;

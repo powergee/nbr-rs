@@ -279,6 +279,11 @@ impl Guard {
         &mut self.coll_mut().threads[self.tid]
     }
 
+    #[inline]
+    fn is_unprotected(&self) -> bool {
+        self.collector.is_null()
+    }
+
     /// Start read phase.
     ///
     /// In read phase, programmers must aware following restrictions.
@@ -305,6 +310,10 @@ impl Guard {
     /// to this local list, it might corrupt the structure of the list.
     #[inline(never)]
     pub fn start_read(&self) {
+        if self.is_unprotected() {
+            return;
+        }
+
         let thread = &mut self.coll_mut().threads[self.tid];
         assert!(
             !recovery::is_restartable(),
@@ -318,6 +327,10 @@ impl Guard {
     /// Prevent other threads from deleting the record.
     #[inline]
     pub fn protect<T>(&self, ptr: *mut T) {
+        if self.is_unprotected() {
+            return;
+        }
+
         let thread = self.thread_mut();
         let hazptr_len = thread.proposed_len.load(Ordering::Acquire);
         if hazptr_len == thread.proposed_hazptrs.len() {
@@ -332,6 +345,10 @@ impl Guard {
     /// Note that it is also equivalent to upgrading to write phase.
     #[inline]
     pub fn end_read(&self) {
+        if self.is_unprotected() {
+            return;
+        }
+
         recovery::set_restartable(false);
     }
 
@@ -345,6 +362,11 @@ impl Guard {
     /// * The same block is not retired more than once.
     #[inline]
     pub unsafe fn retire<T>(&self, ptr: *mut T) {
+        if self.is_unprotected() {
+            drop(Box::from_raw(ptr));
+            return;
+        }
+
         let collector = self.coll_mut();
         let num_threads = collector.num_threads;
 
@@ -413,6 +435,25 @@ impl Guard {
 
         self.thread_mut().retired_mut().push(ptr);
     }
+}
+
+/// Get a dummy `Guard` associated with no collector.
+/// 
+/// In a dummy `Guard`, `start_read`, `end_read` and `protect`
+/// have no effect, and `retire` reclaims a block immediately.
+/// 
+/// # Safety
+/// 
+/// Use the unprotected `Guard` only if the data structure
+/// is not accessed concurrently.
+pub unsafe fn unprotected() -> &'static Guard {
+    struct GuardWrapper(Guard);
+    unsafe impl Sync for GuardWrapper {}
+    static UNPROTECTED: GuardWrapper = GuardWrapper(Guard {
+        collector: null_mut(),
+        tid: 0,
+    });
+    &UNPROTECTED.0
 }
 
 #[cfg(test)]
