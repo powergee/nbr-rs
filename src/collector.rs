@@ -438,12 +438,12 @@ impl Guard {
 }
 
 /// Get a dummy `Guard` associated with no collector.
-/// 
+///
 /// In a dummy `Guard`, `start_read`, `end_read` and `protect`
 /// have no effect, and `retire` reclaims a block immediately.
-/// 
+///
 /// # Safety
-/// 
+///
 /// Use the unprotected `Guard` only if the data structure
 /// is not accessed concurrently.
 pub unsafe fn unprotected() -> &'static Guard {

@@ -12,3 +12,7 @@ nix = "0.26.2"
 [dev-dependencies]
 crossbeam-utils = "0.8"
 rand = "0.8"
+
+[profile.release-with-debug]
+inherits = "release"
+debug = true

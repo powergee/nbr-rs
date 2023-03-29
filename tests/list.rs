@@ -111,8 +111,8 @@ where
         };
         let mut prev_next;
 
-        'search_loop: loop {
-            read_phase!(guard; [untagged(cursor.prev), untagged(cursor.curr)] => {
+        loop {
+            read_phase!(guard; [cursor.prev, cursor.curr] => {
                 cursor.prev = &self.head as *const _ as *mut Node<K, V>;
                 cursor.curr = self.head.load(Ordering::Acquire);
                 prev_next = cursor.curr;
@@ -142,13 +142,13 @@ where
                 return cursor;
             }
 
-            let prev_ref = unsafe { &*untagged(cursor.prev) };
+            let prev_ref = unsafe { &*cursor.prev };
             if prev_ref
                 .next
                 .compare_exchange(prev_next, cursor.curr, Ordering::Release, Ordering::Relaxed)
                 .is_err()
             {
-                continue 'search_loop;
+                continue;
             }
 
             let mut node = prev_next;
