@@ -15,7 +15,7 @@ You can see [an implementation of Harris's list](tests/list.rs) as an example.
 ```rust
 use nbr_rs::{read_phase, Collector, Guard};
 
-let collector = Arc::new(Collector::new(THREADS, MAX_HAZPTRS_PER_THREAD));
+let collector = &Collector::new(THREADS, MAX_HAZPTRS_PER_THREAD);
 
 /* ... initializing a concurrent data structure */
 
