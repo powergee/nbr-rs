@@ -88,7 +88,7 @@ macro_rules! read_phase {
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
         { $($t)* }
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    
+
         $(
             ($guard).protect($record);
         )*

@@ -2,12 +2,12 @@
 /// with Neutralization Based Reclamation (NBR+).
 use nix::errno::Errno;
 use nix::sys::pthread::pthread_self;
+use rustc_hash::FxHashSet;
 use std::sync::atomic::{compiler_fence, fence, AtomicU64};
 use std::sync::Barrier;
 use std::{
     cell::RefCell,
-    collections::HashSet,
-    ptr::{null_mut, NonNull},
+    ptr::null_mut,
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
@@ -37,7 +37,7 @@ struct Thread {
     proposed_hazptrs: Vec<AtomicPtr<u8>>,
     // Each reclaimer scans hazard pointers across threads
     // to free retired its bag such that any hazard pointers aren't freed.
-    scanned_hazptrs: RefCell<HashSet<*mut u8>>,
+    scanned_hazptrs: RefCell<FxHashSet<*mut u8>>,
     // A helper to allocate and recycle blocks
     //
     // In the original implementation, `reclaimer_nbr` has
@@ -54,7 +54,6 @@ struct Thread {
     // Used for NBR+ signal optimization
     announced_ts: AtomicUsize,
     saved_ts: Vec<usize>,
-    saved_retired_head: Option<NonNull<u8>>,
     first_lo_entry_flag: bool,
     retires_since_lo_watermark: usize,
 }
@@ -77,7 +76,6 @@ impl Thread {
             temp_patience: MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE,
             announced_ts: AtomicUsize::new(0),
             saved_ts: vec![0; num_threads],
-            saved_retired_head: None,
             first_lo_entry_flag: true,
             retires_since_lo_watermark: 0,
         }
@@ -112,11 +110,6 @@ impl Thread {
                     && ((self.retires_since_lo_watermark % OPS_BEFORE_TRYRECLAIM_LOWATERMARK) == 0)
             }
         }
-    }
-
-    #[inline]
-    fn set_lo_watermark(&mut self) {
-        self.saved_retired_head = Some(NonNull::new(self.retired_mut().peek().ptr()).unwrap());
     }
 
     fn send_freeable_to_pool(&mut self) {
@@ -369,9 +362,6 @@ impl Guard {
                     .announced_ts
                     .fetch_add(1, Ordering::SeqCst);
 
-                // Full bag shall be reclaimed so clear any bag head.
-                // Avoiding changes to arg of this reclaim_freeable.
-                self.thread_mut().saved_retired_head = None;
                 collector.reclaim_freeable(self.tid);
 
                 self.thread_mut().first_lo_entry_flag = true;
@@ -389,7 +379,6 @@ impl Guard {
             // at least once after I saved my baghead.
             if self.thread_mut().first_lo_entry_flag {
                 self.thread_mut().first_lo_entry_flag = false;
-                self.thread_mut().set_lo_watermark();
 
                 // Take a snapshot of all other announce_ts,
                 // to be used to know if its time to reclaim at lo-path.
@@ -407,7 +396,6 @@ impl Guard {
                     // from the baghead to tail in functions depicting reclamation of lo-watermark path.
                     collector.reclaim_freeable(self.tid);
 
-                    self.thread_mut().saved_retired_head = None;
                     self.thread_mut().first_lo_entry_flag = true;
                     self.thread_mut().retires_since_lo_watermark = 0;
                     for j in 0..num_threads {
