@@ -65,6 +65,18 @@ impl BlockBag {
         }
     }
 
+    pub fn peek(&self) -> &Retired {
+        assert!(!self.is_empty());
+        unsafe {
+            let head_ref = self.head.as_ref().unwrap();
+            if head_ref.is_empty() {
+                (*head_ref.next).peek()
+            } else {
+                head_ref.peek()
+            }
+        }
+    }
+
     pub fn deallocate_all(&mut self) {
         while !self.is_empty() {
             unsafe { self.pop().deallocate() };
@@ -188,6 +200,11 @@ impl Block {
         let ret = mem::take(&mut self.data[self.size - 1]);
         self.size -= 1;
         ret
+    }
+
+    pub fn peek(&self) -> &Retired {
+        assert!(self.size > 0);
+        &self.data[self.size - 1]
     }
 }
 

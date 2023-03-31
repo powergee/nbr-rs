@@ -7,7 +7,7 @@ use std::sync::atomic::{compiler_fence, fence, AtomicU64};
 use std::sync::Barrier;
 use std::{
     cell::RefCell,
-    ptr::null_mut,
+    ptr::{null_mut, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
@@ -53,6 +53,7 @@ struct Thread {
 
     // Used for NBR+ signal optimization
     announced_ts: AtomicUsize,
+    saved_retired_head: Option<NonNull<u8>>,
     saved_ts: Vec<usize>,
     first_lo_entry_flag: bool,
     retires_since_lo_watermark: usize,
@@ -75,6 +76,7 @@ impl Thread {
             pool,
             temp_patience: MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE,
             announced_ts: AtomicUsize::new(0),
+            saved_retired_head: None,
             saved_ts: vec![0; num_threads],
             first_lo_entry_flag: true,
             retires_since_lo_watermark: 0,
@@ -112,11 +114,28 @@ impl Thread {
         }
     }
 
+    #[inline]
+    fn set_lo_watermark(&mut self) {
+        self.saved_retired_head = Some(NonNull::new(self.retired_mut().peek().ptr()).unwrap());
+    }
+
+    #[inline]
     fn send_freeable_to_pool(&mut self) {
         let retired = self.retired_mut();
 
         let mut spare_bag = BlockBag::new(self.pool);
 
+        if let Some(saved) = self.saved_retired_head {
+            // Reclaim due to a lo-watermark path
+            while retired.peek().ptr() != saved.as_ptr() {
+                let ret = retired.pop();
+                spare_bag.push_retired(ret);
+            }
+        }
+
+        // Deallocate freeable records.
+        // Note that even if we are on a lo-watermark path,
+        // we must check a pointer is protected or not anyway.
         while !retired.is_empty() {
             let ret = retired.pop();
             if self.scanned_hazptrs.borrow().contains(&ret.ptr()) {
@@ -128,8 +147,7 @@ impl Thread {
 
         // Add all collected but protected records back to `retired`
         while !spare_bag.is_empty() {
-            let ret = spare_bag.pop();
-            retired.push_retired(ret);
+            retired.push_retired(spare_bag.pop());
         }
     }
 }
@@ -362,6 +380,9 @@ impl Guard {
                     .announced_ts
                     .fetch_add(1, Ordering::SeqCst);
 
+                // Full bag shall be reclaimed so clear any bag head.
+                // Avoiding changes to arg of this reclaim_freeable.
+                self.thread_mut().saved_retired_head = None;
                 collector.reclaim_freeable(self.tid);
 
                 self.thread_mut().first_lo_entry_flag = true;
@@ -379,6 +400,7 @@ impl Guard {
             // at least once after I saved my baghead.
             if self.thread_mut().first_lo_entry_flag {
                 self.thread_mut().first_lo_entry_flag = false;
+                self.thread_mut().set_lo_watermark();
 
                 // Take a snapshot of all other announce_ts,
                 // to be used to know if its time to reclaim at lo-path.
@@ -446,7 +468,7 @@ mod tests {
         time::Duration,
     };
 
-    const THREADS: usize = 2;
+    const THREADS: usize = 16;
 
     #[test]
     fn restart_all() {
@@ -477,7 +499,7 @@ mod tests {
             while started.load(Ordering::SeqCst) < THREADS {
                 std::thread::sleep(Duration::from_micros(1));
             }
-            unsafe { collector.restart_all_threads(guard.tid) };
+            unsafe { collector.restart_all_threads(guard.tid).unwrap() };
         })
         .unwrap();
     }
