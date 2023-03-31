@@ -6,17 +6,18 @@ use rustc_hash::FxHashSet;
 use std::sync::atomic::{compiler_fence, fence, AtomicU64};
 use std::sync::Barrier;
 use std::{
-    cell::RefCell,
+    cell::{RefCell, Cell},
     ptr::{null_mut, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
 use crate::block_bag::{BlockBag, BlockPool, BLOCK_SIZE};
+use crate::stats;
 use crate::recovery;
 
-const OPS_BEFORE_TRYRECLAIM_LOWATERMARK: usize = 16000;
+const OPS_BEFORE_TRYRECLAIM_LOWATERMARK: usize = 32;
 #[cfg(not(sanitize = "address"))]
-const MAX_RINGBAG_CAPACITY_POW2: usize = 32768;
+const MAX_RINGBAG_CAPACITY_POW2: usize = 256;
 #[cfg(sanitize = "address")]
 const MAX_RINGBAG_CAPACITY_POW2: usize = 8;
 
@@ -136,14 +137,17 @@ impl Thread {
         // Deallocate freeable records.
         // Note that even if we are on a lo-watermark path,
         // we must check a pointer is protected or not anyway.
+        let mut reclaimed = 0;
         while !retired.is_empty() {
             let ret = retired.pop();
             if self.scanned_hazptrs.borrow().contains(&ret.ptr()) {
                 spare_bag.push_retired(ret);
             } else {
+                reclaimed += 1;
                 unsafe { ret.deallocate() };
             }
         }
+        stats::decr_garb(reclaimed);
 
         // Add all collected but protected records back to `retired`
         while !spare_bag.is_empty() {
@@ -247,9 +251,12 @@ impl Collector {
 unsafe impl Send for Collector {}
 unsafe impl Sync for Collector {}
 
+const SYNC_RETIRED_COUNT_BY: usize = 32;
+
 pub struct Guard {
     collector: *mut Collector,
     tid: ThreadId,
+    retired_cnt_buff: Cell<usize>,
 }
 
 impl Guard {
@@ -257,6 +264,7 @@ impl Guard {
         Self {
             collector: collector as *const _ as _,
             tid,
+            retired_cnt_buff: Cell::new(0),
         }
     }
 
@@ -275,6 +283,18 @@ impl Guard {
     #[inline]
     fn is_unprotected(&self) -> bool {
         self.collector.is_null()
+    }
+
+    fn incr_cnt_buff(&self) -> usize {
+        let new_cnt = self.retired_cnt_buff.get() + 1;
+        self.retired_cnt_buff.set(new_cnt);
+        new_cnt
+    }
+
+    fn flush_cnt_buff(&self) {
+        let cnt = self.retired_cnt_buff.get();
+        self.retired_cnt_buff.set(0);
+        stats::incr_garb(cnt);
     }
 
     /// Start read phase.
@@ -362,6 +382,7 @@ impl Guard {
             return;
         }
 
+        let cnt_buff = self.incr_cnt_buff();
         let collector = self.coll_mut();
         let num_threads = collector.num_threads;
 
@@ -379,6 +400,8 @@ impl Guard {
                 self.thread_mut()
                     .announced_ts
                     .fetch_add(1, Ordering::SeqCst);
+
+                self.flush_cnt_buff();
 
                 // Full bag shall be reclaimed so clear any bag head.
                 // Avoiding changes to arg of this reclaim_freeable.
@@ -414,6 +437,8 @@ impl Guard {
                 if collector.threads[i].announced_ts.load(Ordering::SeqCst)
                     >= self.thread_mut().saved_ts[i] + 2
                 {
+                    self.flush_cnt_buff();
+
                     // If the baghead is not `None`, then reclamation shall happen
                     // from the baghead to tail in functions depicting reclamation of lo-watermark path.
                     collector.reclaim_freeable(self.tid);
@@ -433,6 +458,10 @@ impl Guard {
         }
 
         self.thread_mut().retired_mut().push(ptr);
+
+        if cnt_buff % SYNC_RETIRED_COUNT_BY == 0 {
+            self.flush_cnt_buff();
+        }
     }
 }
 
@@ -451,6 +480,7 @@ pub unsafe fn unprotected() -> &'static Guard {
     static UNPROTECTED: GuardWrapper = GuardWrapper(Guard {
         collector: null_mut(),
         tid: 0,
+        retired_cnt_buff: Cell::new(0),
     });
     &UNPROTECTED.0
 }
