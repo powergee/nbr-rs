@@ -1,7 +1,4 @@
-use core::{
-    ptr,
-    sync::atomic::{compiler_fence, Ordering},
-};
+use core::{mem, ptr};
 
 pub(crate) struct BlockBag {
     size_in_blocks: usize,
@@ -40,14 +37,12 @@ impl BlockBag {
         self.push_retired(Retired::new(obj));
     }
 
-    #[inline]
     pub fn push_retired(&mut self, ret: Retired) {
         let head_ref = unsafe { self.head.as_mut().unwrap() };
         head_ref.push_retired(ret);
         if head_ref.is_full() {
             let new_head = unsafe { self.pool.as_mut().unwrap() }.allocate(self.head);
             self.size_in_blocks += 1;
-            compiler_fence(Ordering::SeqCst);
             self.head = new_head;
         }
     }
@@ -70,17 +65,21 @@ impl BlockBag {
         }
     }
 
-    pub fn deallocate_all(&mut self) {
-        while !self.is_empty() {
-            unsafe { self.pop().deallocate() };
+    pub fn peek(&self) -> &Retired {
+        assert!(!self.is_empty());
+        unsafe {
+            let head_ref = self.head.as_mut().unwrap();
+            if head_ref.is_empty() {
+                (*head_ref.next).peek()
+            } else {
+                head_ref.peek()
+            }
         }
     }
 
-    pub fn first_non_empty_block(&self) -> *mut Block {
-        if self.is_empty() {
-            ptr::null_mut()
-        } else {
-            self.head
+    pub fn deallocate_all(&mut self) {
+        while !self.is_empty() {
+            unsafe { self.pop().deallocate() };
         }
     }
 }
@@ -140,6 +139,7 @@ impl BlockPool {
     }
 
     pub fn try_recycle(&mut self, block: *mut Block) {
+        assert!(unsafe { &*block }.is_empty());
         if self.size == MAX_BLOCK_POOL_SIZE {
             drop(unsafe { Box::from_raw(block) });
         } else {
@@ -174,7 +174,7 @@ impl Block {
         Self {
             next,
             size: 0,
-            data: [Retired::default(); BLOCK_SIZE],
+            data: Default::default(),
         }
     }
 
@@ -188,22 +188,23 @@ impl Block {
         self.size == 0
     }
 
-    #[inline]
     pub fn push_retired(&mut self, ret: Retired) {
         assert!(self.size < BLOCK_SIZE);
         let prev_size = self.size;
         self.data[prev_size] = ret;
-        compiler_fence(Ordering::SeqCst);
         self.size = prev_size + 1;
     }
 
-    #[inline]
     pub fn pop(&mut self) -> Retired {
         assert!(self.size > 0);
-        let ret = self.data[self.size - 1];
+        let ret = mem::take(&mut self.data[self.size - 1]);
         self.size -= 1;
-        // Used `new` instead of `new_unchecked` for debug
         ret
+    }
+
+    pub fn peek(&self) -> &Retired {
+        assert!(self.size > 0);
+        &self.data[self.size - 1]
     }
 }
 
@@ -213,7 +214,6 @@ impl Drop for Block {
     }
 }
 
-#[derive(Clone, Copy)]
 pub(crate) struct Retired {
     ptr: *mut u8,
     deleter: unsafe fn(*mut u8),

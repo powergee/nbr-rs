@@ -70,7 +70,7 @@ macro_rules! set_checkpoint {
 /// ```
 #[macro_export]
 macro_rules! read_phase {
-    ($guard:expr; [$($record:expr),*] => $($t:tt)*) => {
+    ($guard:expr; [$($record:expr),*] => $($t:tt)*) => {{
         // `sigsetjmp` must called first. (in `set_checkpoint!()`)
         //
         // Since, if `sigsetjmp` is done later than other jobs
@@ -83,14 +83,20 @@ macro_rules! read_phase {
         unsafe { $crate::set_checkpoint!() };
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
         ($guard).start_read();
+
+        // The body of read phase
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-
         { $($t)* }
-
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    
         $(
             ($guard).protect($record);
         )*
-        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+        // fence(SeqCst) is issued when `RESTARTABLE` is set to false
+        // in `end_read`.
         ($guard).end_read();
-    };
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }};
 }

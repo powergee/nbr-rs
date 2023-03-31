@@ -5,7 +5,7 @@ use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal
 use setjmp::{sigjmp_buf, siglongjmp};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
-use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use std::sync::atomic::{compiler_fence, fence, AtomicBool, Ordering};
 
 static mut NEUTRALIZE_SIGNAL: Signal = Signal::SIGUSR1;
 static mut SIG_ACTION: MaybeUninit<SigAction> = MaybeUninit::uninit();
@@ -47,7 +47,16 @@ pub(crate) fn is_restartable() -> bool {
 
 #[inline]
 pub(crate) fn set_restartable(set_rest: bool) {
+    // On the original paper, RESTARTABLE variable is modified by CAS.
+    // This is because, on x86 devices, CAS prevents instruction reordering
+    // so that additional memory fences are not necessary.
+    //
+    // However, a memory fence is needed
+    // in other environments with relaxed memory model.
+    // In this implementation, we use atomic storing and a fence
+    // instead of a single CAS.
     RESTARTABLE.with(|rest| rest.store(set_rest, Ordering::Release));
+    fence(Ordering::SeqCst);
 }
 
 /// Get a current neutralize signal.

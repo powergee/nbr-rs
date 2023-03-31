@@ -1,16 +1,17 @@
 /// A concurrent garbage collector
 /// with Neutralization Based Reclamation (NBR+).
+use nix::errno::Errno;
 use nix::sys::pthread::pthread_self;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{compiler_fence, fence, AtomicU64};
 use std::sync::Barrier;
 use std::{
     cell::RefCell,
     collections::HashSet,
-    ptr::null_mut,
+    ptr::{null_mut, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
-use crate::block_bag::{Block, BlockBag, BlockPool, BLOCK_SIZE};
+use crate::block_bag::{BlockBag, BlockPool, BLOCK_SIZE};
 use crate::recovery;
 
 const OPS_BEFORE_TRYRECLAIM_LOWATERMARK: usize = 16000;
@@ -53,7 +54,7 @@ struct Thread {
     // Used for NBR+ signal optimization
     announced_ts: AtomicUsize,
     saved_ts: Vec<usize>,
-    saved_block_head: *mut Block,
+    saved_retired_head: Option<NonNull<u8>>,
     first_lo_entry_flag: bool,
     retires_since_lo_watermark: usize,
 }
@@ -76,7 +77,7 @@ impl Thread {
             temp_patience: MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE,
             announced_ts: AtomicUsize::new(0),
             saved_ts: vec![0; num_threads],
-            saved_block_head: null_mut(),
+            saved_retired_head: None,
             first_lo_entry_flag: true,
             retires_since_lo_watermark: 0,
         }
@@ -101,57 +102,41 @@ impl Thread {
 
     #[inline]
     fn is_past_lo_watermark(&mut self) -> bool {
-        (self.retired_mut().size_in_blocks() as f32
-            > (self.temp_patience as f32 * (1.0f32 / ((self.tid % 3) + 2) as f32)))
-            && ((self.retires_since_lo_watermark % OPS_BEFORE_TRYRECLAIM_LOWATERMARK) == 0)
+        cfg_if::cfg_if! {
+            // When sanitizing, reclaim more aggressively.
+            if #[cfg(sanitize = "address")] {
+                !self.retired_mut().is_empty()
+            } else {
+                (self.retired_mut().size_in_blocks() as f32
+                    > (self.temp_patience as f32 * (1.0f32 / ((self.tid % 3) + 2) as f32)))
+                    && ((self.retires_since_lo_watermark % OPS_BEFORE_TRYRECLAIM_LOWATERMARK) == 0)
+            }
+        }
     }
 
     #[inline]
     fn set_lo_watermark(&mut self) {
-        self.saved_block_head = self.retired_mut().first_non_empty_block();
+        self.saved_retired_head = Some(NonNull::new(self.retired_mut().peek().ptr()).unwrap());
     }
 
-    #[inline]
     fn send_freeable_to_pool(&mut self) {
         let retired = self.retired_mut();
 
-        if !self.saved_block_head.is_null() {
-            // Reclaim due to a lo-watermark path
-            let mut spare_bag = BlockBag::new(self.pool);
+        let mut spare_bag = BlockBag::new(self.pool);
 
-            while !retired.is_empty() && retired.first_non_empty_block() != self.saved_block_head {
-                let ret = retired.pop();
+        while !retired.is_empty() {
+            let ret = retired.pop();
+            if self.scanned_hazptrs.borrow().contains(&ret.ptr()) {
                 spare_bag.push_retired(ret);
-            }
-
-            // Deallocate blocks and clear the bag.
-            // It may not reclaim non full blocks.
-            while !retired.is_empty() {
-                let ret = retired.pop();
+            } else {
                 unsafe { ret.deallocate() };
             }
+        }
 
-            while !spare_bag.is_empty() {
-                retired.push_retired(spare_bag.pop());
-            }
-        } else {
-            // Reclaim due to a hi-watermark path
-            let mut spare_bag = BlockBag::new(self.pool);
-
-            while !retired.is_empty() {
-                let ret = retired.pop();
-                if self.scanned_hazptrs.borrow().contains(&ret.ptr()) {
-                    spare_bag.push_retired(ret);
-                } else {
-                    unsafe { ret.deallocate() };
-                }
-            }
-
-            // Add all collected but protected records back to `retired`
-            while !spare_bag.is_empty() {
-                let ret = spare_bag.pop();
-                retired.push_retired(ret);
-            }
+        // Add all collected but protected records back to `retired`
+        while !spare_bag.is_empty() {
+            let ret = spare_bag.pop();
+            retired.push_retired(ret);
         }
     }
 }
@@ -194,24 +179,22 @@ impl Collector {
         }
     }
 
-    #[inline]
-    unsafe fn restart_all_threads(&self, reclaimer: ThreadId) {
+    unsafe fn restart_all_threads(&self, reclaimer: ThreadId) -> Result<(), Errno> {
         for other_tid in 0..self.num_threads {
             if other_tid == reclaimer {
                 continue;
             }
             let pthread = self.registered_map[other_tid].load(Ordering::Acquire);
-            if let Err(err) = recovery::send_signal(pthread) {
-                panic!("Failed to restart other threads: {err}");
-            }
+            recovery::send_signal(pthread)?;
         }
+        Ok(())
     }
 
-    #[inline]
     fn collect_all_saved_records(&self, reclaimer: ThreadId) {
         // Set where record would be collected in.
         let mut scanned = self.threads[reclaimer].scanned_hazptrs.borrow_mut();
         scanned.clear();
+        fence(Ordering::SeqCst);
 
         for other_tid in 0..self.num_threads {
             let len = self.threads[other_tid].proposed_len.load(Ordering::Acquire);
@@ -223,7 +206,6 @@ impl Collector {
         }
     }
 
-    #[inline]
     fn reclaim_freeable(&mut self, reclaimer: ThreadId) {
         self.collect_all_saved_records(reclaimer);
         self.threads[reclaimer].send_freeable_to_pool();
@@ -325,7 +307,6 @@ impl Guard {
     }
 
     /// Prevent other threads from deleting the record.
-    #[inline]
     pub fn protect<T>(&self, ptr: *mut T) {
         if self.is_unprotected() {
             return;
@@ -336,7 +317,11 @@ impl Guard {
         if hazptr_len == thread.proposed_hazptrs.len() {
             panic!("The hazard pointer bag is already full.");
         }
+        compiler_fence(Ordering::SeqCst);
+
         thread.proposed_hazptrs[hazptr_len].store(ptr as *mut _, Ordering::Release);
+        compiler_fence(Ordering::SeqCst);
+
         thread.proposed_len.store(hazptr_len + 1, Ordering::Release);
     }
 
@@ -360,7 +345,6 @@ impl Guard {
     /// * It is no longer possible to reach the block from
     ///   the data structure.
     /// * The same block is not retired more than once.
-    #[inline]
     pub unsafe fn retire<T>(&self, ptr: *mut T) {
         if self.is_unprotected() {
             drop(Box::from_raw(ptr));
@@ -375,23 +359,27 @@ impl Guard {
             self.thread_mut()
                 .announced_ts
                 .fetch_add(1, Ordering::SeqCst);
+            compiler_fence(Ordering::SeqCst);
 
-            collector.restart_all_threads(self.tid);
-            // Tell other threads that I have done signaling.
-            self.thread_mut()
-                .announced_ts
-                .fetch_add(1, Ordering::SeqCst);
+            if let Err(err) = collector.restart_all_threads(self.tid) {
+                panic!("Failed to restart other threads: {err}");
+            } else {
+                // Tell other threads that I have done signaling.
+                self.thread_mut()
+                    .announced_ts
+                    .fetch_add(1, Ordering::SeqCst);
 
-            // Full bag shall be reclaimed so clear any bag head.
-            // Avoiding changes to arg of this reclaim_freeable.
-            self.thread_mut().saved_block_head = null_mut();
-            collector.reclaim_freeable(self.tid);
+                // Full bag shall be reclaimed so clear any bag head.
+                // Avoiding changes to arg of this reclaim_freeable.
+                self.thread_mut().saved_retired_head = None;
+                collector.reclaim_freeable(self.tid);
 
-            self.thread_mut().first_lo_entry_flag = true;
-            self.thread_mut().retires_since_lo_watermark = 0;
+                self.thread_mut().first_lo_entry_flag = true;
+                self.thread_mut().retires_since_lo_watermark = 0;
 
-            for i in 0..num_threads {
-                self.thread_mut().saved_ts[i] = 0;
+                for i in 0..num_threads {
+                    self.thread_mut().saved_ts[i] = 0;
+                }
             }
         } else if self.thread_mut().is_past_lo_watermark() {
             // On the first entry to lo-path, I shall save my baghead.
@@ -403,22 +391,23 @@ impl Guard {
                 self.thread_mut().first_lo_entry_flag = false;
                 self.thread_mut().set_lo_watermark();
 
-                // Take a relaxed snapshot of all other announce_ts,
+                // Take a snapshot of all other announce_ts,
                 // to be used to know if its time to reclaim at lo-path.
                 for i in 0..num_threads {
-                    self.thread_mut().saved_ts[i] =
-                        collector.threads[i].announced_ts.load(Ordering::Relaxed);
+                    let ts = collector.threads[i].announced_ts.load(Ordering::SeqCst);
+                    self.thread_mut().saved_ts[i] = ts + (ts % 2);
                 }
             }
 
             for i in 0..num_threads {
-                if collector.threads[i].announced_ts.load(Ordering::Relaxed)
+                if collector.threads[i].announced_ts.load(Ordering::SeqCst)
                     >= self.thread_mut().saved_ts[i] + 2
                 {
                     // If the baghead is not `None`, then reclamation shall happen
                     // from the baghead to tail in functions depicting reclamation of lo-watermark path.
                     collector.reclaim_freeable(self.tid);
 
+                    self.thread_mut().saved_retired_head = None;
                     self.thread_mut().first_lo_entry_flag = true;
                     self.thread_mut().retires_since_lo_watermark = 0;
                     for j in 0..num_threads {
