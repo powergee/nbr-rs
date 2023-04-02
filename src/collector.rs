@@ -1,19 +1,23 @@
 /// A concurrent garbage collector
 /// with Neutralization Based Reclamation (NBR+).
+use atomic::Atomic;
 use nix::errno::Errno;
-use nix::sys::pthread::pthread_self;
+use nix::sys::pthread::{pthread_self, Pthread};
 use rustc_hash::FxHashSet;
-use std::sync::atomic::{compiler_fence, fence, AtomicU64};
+use static_assertions::const_assert;
+use std::sync::atomic::{compiler_fence, fence};
 use std::sync::Barrier;
 use std::{
-    cell::{RefCell, Cell},
+    cell::{Cell, RefCell},
     ptr::{null_mut, NonNull},
     sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
 };
 
 use crate::block_bag::{BlockBag, BlockPool, BLOCK_SIZE};
-use crate::stats;
 use crate::recovery;
+use crate::stats;
+
+const_assert!(Atomic::<Pthread>::is_lock_free());
 
 const OPS_BEFORE_TRYRECLAIM_LOWATERMARK: usize = 32;
 #[cfg(not(sanitize = "address"))]
@@ -170,9 +174,9 @@ impl Drop for Thread {
 pub struct Collector {
     num_threads: usize,
     threads: Vec<Thread>,
-    // Map from Thread ID into pthread_t(u64)
+    // Map from Thread ID into pthread_t(u64 or usize, which depends on platforms)
     // for each registered thread
-    registered_map: Vec<AtomicU64>,
+    registered_map: Vec<Atomic<Pthread>>,
     registered_count: AtomicUsize,
     barrier: Barrier,
 }
@@ -188,7 +192,7 @@ impl Collector {
         Self {
             num_threads,
             threads,
-            registered_map: (0..num_threads).map(|_| AtomicU64::new(0)).collect(),
+            registered_map: (0..num_threads).map(|_| Atomic::new(0)).collect(),
             registered_count: AtomicUsize::new(0),
             barrier: Barrier::new(num_threads),
         }

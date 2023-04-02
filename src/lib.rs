@@ -1,8 +1,8 @@
 #![feature(cfg_sanitize)]
 mod block_bag;
 mod collector;
-mod stats;
 pub mod recovery;
+mod stats;
 
 pub use collector::{unprotected, Collector, Guard, ThreadId};
 pub use stats::count_garbages;
