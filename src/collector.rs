@@ -65,10 +65,10 @@ struct Thread {
 }
 
 impl Thread {
-    pub fn new(tid: usize, num_threads: usize, max_hazptr_per_thred: usize) -> Self {
+    pub fn new(tid: usize, num_threads: usize, max_hazptr_per_thread: usize) -> Self {
         let pool = Box::into_raw(Box::<BlockPool>::default());
         let retired = Box::into_raw(Box::new(BlockBag::new(pool)));
-        let proposed_hazptrs = (0..max_hazptr_per_thred)
+        let proposed_hazptrs = (0..max_hazptr_per_thread)
             .map(|_| AtomicPtr::new(null_mut()))
             .collect();
 
@@ -182,11 +182,11 @@ pub struct Collector {
 }
 
 impl Collector {
-    pub fn new(num_threads: usize, max_hazptr_per_thred: usize) -> Self {
+    pub fn new(num_threads: usize, max_hazptr_per_thread: usize) -> Self {
         unsafe { recovery::install() };
 
         let threads = (0..num_threads)
-            .map(|tid| Thread::new(tid, num_threads, max_hazptr_per_thred))
+            .map(|tid| Thread::new(tid, num_threads, max_hazptr_per_thread))
             .collect();
 
         Self {
