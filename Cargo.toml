@@ -10,7 +10,7 @@ readme = "README.md"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-setjmp = "0.1.4"
+setjmp = { git = "https://github.com/powergee/setjmp.rs.git" }
 nix = "0.26.2"
 cfg-if = "1.0"
 rustc-hash = "1.1.0"
