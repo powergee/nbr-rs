@@ -129,4 +129,35 @@ macro_rules! read_phase {
         }
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }};
+
+    ($guard:expr => $($t:tt)*) => {{
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        loop {
+            // `sigsetjmp` must called first. (in `set_checkpoint!()`)
+            //
+            // Since, if `sigsetjmp` is done later than other jobs
+            // in `start_read`, the restartable would never be set to 1
+            // and the upgrade assert will fail.
+            //
+            // Also, it "must be inlined" because longjmp can only jump up
+            // the call stack, to functions that are still executing.
+            unsafe { $crate::set_checkpoint!() };
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            ($guard).start_read();
+
+            // The body of read phase
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            { $($t)* }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+            // fence(SeqCst) is issued when `RESTARTABLE` is set to false
+            // in `end_read`.
+            ($guard).end_read();
+
+            if $crate::black_boxed_true() {
+                break;
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }};
 }
