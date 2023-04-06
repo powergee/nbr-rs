@@ -1,4 +1,5 @@
 #![feature(cfg_sanitize)]
+#![feature(core_intrinsics)]
 mod block_bag;
 mod collector;
 pub mod recovery;
@@ -9,6 +10,14 @@ pub use stats::count_garbages;
 
 pub use nix::sys::signal;
 pub use setjmp;
+
+/// Returns a black-boxed true which a compiler
+/// doesn't optimize out.
+///
+/// For usage of this function, please refer to `read_phase`.
+pub fn black_boxed_true() -> bool {
+    core::intrinsics::black_box(true)
+}
 
 /// Make a checkpoint with `sigsetjmp` for
 /// recovering in read phase.
@@ -70,35 +79,54 @@ macro_rules! set_checkpoint {
 ///
 /// /* At this point, all _protecteei_ are protected. */
 /// ```
+///
+/// # HACK: "Why a dummy loop with `black_box` is used?"
+///
+/// It is not needed in normal builds, but
+/// when address-sanitizing, the address sanitizer often gives
+/// a false positive by recognizing `longjmp` as
+/// stack buffer overflow (or stack corruption).
+///
+/// However, awkwardly, if it wrapped by a loop block,
+/// it seems that the sanitizer recognizes `longjmp` as
+/// normal `continue` operation and totally satisfies with it.
+///
+/// So, they are added to avoid false positives from the sanitizer.
 #[macro_export]
 macro_rules! read_phase {
     ($guard:expr; [$($record:expr),*] => $($t:tt)*) => {{
-        // `sigsetjmp` must called first. (in `set_checkpoint!()`)
-        //
-        // Since, if `sigsetjmp` is done later than other jobs
-        // in `start_read`, the restartable would never be set to 1
-        // and the upgrade assert will fail.
-        //
-        // Also, it "must be inlined" because longjmp can only jump up
-        // the call stack, to functions that are still executing.
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-        unsafe { $crate::set_checkpoint!() };
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-        ($guard).start_read();
+        loop {
+            // `sigsetjmp` must called first. (in `set_checkpoint!()`)
+            //
+            // Since, if `sigsetjmp` is done later than other jobs
+            // in `start_read`, the restartable would never be set to 1
+            // and the upgrade assert will fail.
+            //
+            // Also, it "must be inlined" because longjmp can only jump up
+            // the call stack, to functions that are still executing.
+            unsafe { $crate::set_checkpoint!() };
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            ($guard).start_read();
 
-        // The body of read phase
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-        { $($t)* }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            // The body of read phase
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            { $($t)* }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 
-        $(
-            ($guard).protect($record);
-        )*
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            $(
+                ($guard).protect($record);
+            )*
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 
-        // fence(SeqCst) is issued when `RESTARTABLE` is set to false
-        // in `end_read`.
-        ($guard).end_read();
+            // fence(SeqCst) is issued when `RESTARTABLE` is set to false
+            // in `end_read`.
+            ($guard).end_read();
+
+            if $crate::black_boxed_true() {
+                break;
+            }
+        }
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
     }};
 }
