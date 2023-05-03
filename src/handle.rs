@@ -150,7 +150,7 @@ impl<'c> Handle<'c> {
     }
 
     /// Start read phase. `f` is the body of this read phase, and it must
-    /// return a `Protectable` cursor to safely dereference on the out of
+    /// return a protectable `Cursor` to safely dereference on the out of
     /// this read phase.
     ///
     /// In read phase, programmers must aware following restrictions.
