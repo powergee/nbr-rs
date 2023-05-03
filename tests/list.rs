@@ -114,14 +114,14 @@ where
     fn search(&self, key: &K, handle: &mut Handle) -> Cursor<K, V> {
         loop {
             let cursor = handle.read_phase(|_| {
+                let first = self.head.load(Ordering::Acquire);
                 let mut cursor = Cursor {
                     prev: ptr::null_mut(),
                     prev_link: &self.head,
-                    prev_next: self.head.load(Ordering::Acquire),
-                    curr: ptr::null_mut(),
+                    prev_next: first,
+                    curr: first,
                     found: false,
                 };
-                cursor.curr = cursor.prev_next;
 
                 cursor.found = loop {
                     let curr_node =
@@ -240,7 +240,6 @@ mod tests {
     use crossbeam_utils::thread;
     use nbr_rs::Collector;
     use rand::prelude::*;
-    use std::sync::Arc;
 
     const THREADS: usize = 30;
     const ELEMENTS_PER_THREADS: usize = 1000;
@@ -248,11 +247,10 @@ mod tests {
     #[test]
     fn smoke_list() {
         let map = &List::new();
-        let collector = Arc::new(Collector::new());
+        let collector = &Collector::new();
 
         thread::scope(|s| {
             for t in 0..THREADS {
-                let collector = Arc::clone(&collector);
                 s.spawn(move |_| {
                     let mut guard = collector.register();
                     let mut rng = rand::thread_rng();
@@ -269,7 +267,6 @@ mod tests {
 
         thread::scope(|s| {
             for t in 0..THREADS {
-                let collector = Arc::clone(&collector);
                 s.spawn(move |_| {
                     let mut guard = collector.register();
                     let mut rng = rand::thread_rng();
