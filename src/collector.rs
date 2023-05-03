@@ -142,6 +142,15 @@ impl ThreadList {
     }
 }
 
+impl Drop for ThreadList {
+    fn drop(&mut self) {
+        let mut curr = *self.head.get_mut();
+        while !curr.is_null() {
+            curr = *unsafe { Box::from_raw(curr) }.next.get_mut();
+        }
+    }
+}
+
 struct ThreadIter<'g> {
     curr: *const Thread,
     _marker: PhantomData<&'g ()>,
@@ -227,6 +236,12 @@ impl Thread {
     #[inline]
     pub(crate) fn advance_ts(&self) {
         self.announced_ts.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+impl Drop for Thread {
+    fn drop(&mut self) {
+        unsafe { drop(Box::from_raw(self.hazards.load(Ordering::Acquire))) };
     }
 }
 
