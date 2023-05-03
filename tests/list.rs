@@ -235,6 +235,8 @@ where
 /// Test with Harris List
 #[cfg(test)]
 mod tests {
+    use std::sync::Barrier;
+
     use super::List;
     extern crate rand;
     use crossbeam_utils::thread;
@@ -248,6 +250,7 @@ mod tests {
     fn smoke_list() {
         let map = &List::new();
         let collector = &Collector::new();
+        let barrier = &Barrier::new(THREADS);
 
         thread::scope(|s| {
             for t in 0..THREADS {
@@ -260,6 +263,7 @@ mod tests {
                     for i in keys {
                         assert!(map.insert(i, i.to_string(), &mut guard).is_ok());
                     }
+                    barrier.wait();
                 });
             }
         })
@@ -282,6 +286,7 @@ mod tests {
                             assert_eq!(i.to_string(), *map.get(&i, &mut guard).unwrap());
                         }
                     }
+                    barrier.wait();
                 });
             }
         })

@@ -441,10 +441,7 @@ mod tests {
     use super::Collector;
     use crossbeam_utils::thread;
     use std::{
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        },
+        sync::atomic::{AtomicUsize, Ordering},
         time::Duration,
     };
 
@@ -452,14 +449,11 @@ mod tests {
 
     #[test]
     fn restart_all() {
-        let collector = Arc::new(Collector::new());
-        let started = Arc::new(AtomicUsize::new(0));
+        let collector = &Collector::new();
+        let started = &AtomicUsize::new(0);
 
         thread::scope(|s| {
             for _ in 0..THREADS {
-                let collector = Arc::clone(&collector);
-                let started = Arc::clone(&started);
-
                 s.spawn(move |_| {
                     let handle = collector.register();
                     assert!(!is_restartable());
