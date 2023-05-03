@@ -1,540 +1,253 @@
-/// A concurrent garbage collector
-/// with Neutralization Based Reclamation (NBR+).
-use atomic::Atomic;
-use nix::errno::Errno;
-use nix::sys::pthread::{pthread_self, Pthread};
-use rustc_hash::FxHashSet;
-use static_assertions::const_assert;
-use std::sync::atomic::{compiler_fence, fence};
-use std::sync::Barrier;
 use std::{
-    cell::{Cell, RefCell},
-    ptr::{null_mut, NonNull},
-    sync::atomic::{AtomicPtr, AtomicUsize, Ordering},
+    marker::PhantomData,
+    ptr::null_mut,
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize},
 };
 
-use crate::block_bag::{BlockBag, BlockPool, BLOCK_SIZE};
+use atomic::{fence, Atomic, Ordering};
+use crossbeam_utils::CachePadded;
+use nix::{
+    errno::Errno,
+    sys::pthread::{pthread_self, Pthread},
+};
+use rustc_hash::FxHashSet;
+use static_assertions::const_assert;
+
+use crate::handle::Handle;
 use crate::recovery;
-use crate::stats;
+
+const INITIAL_HAZPTR_CAP: usize = 16;
 
 const_assert!(Atomic::<Pthread>::is_lock_free());
 
-const OPS_BEFORE_TRYRECLAIM_LOWATERMARK: usize = 32;
-#[cfg(not(sanitize = "address"))]
-const MAX_RINGBAG_CAPACITY_POW2: usize = 256;
-#[cfg(sanitize = "address")]
-const MAX_RINGBAG_CAPACITY_POW2: usize = 8;
-
-/// 0-indexed thread identifier.
-/// Note that this ThreadId is not same with pthread_t,
-/// and it is used for only NBR internally.
-pub type ThreadId = usize;
-
-/// Thread-local variables of NBR+
-struct Thread {
-    tid: ThreadId,
-    // Retired records collected by a delete operation
-    retired: *mut BlockBag,
-    // Saves the discovered records before upgrading to write
-    // to protect records from concurrent reclaimer threads.
-    // (Single-Writer Multi-Reader)
-    proposed_len: AtomicUsize,
-    proposed_hazptrs: Vec<AtomicPtr<u8>>,
-    // Each reclaimer scans hazard pointers across threads
-    // to free retired its bag such that any hazard pointers aren't freed.
-    scanned_hazptrs: RefCell<FxHashSet<*mut u8>>,
-    // A helper to allocate and recycle blocks
-    //
-    // In the original implementation, `reclaimer_nbr` has
-    // `pool` as a member, which is a subclass of `pool_interface`.
-    // And `pool_interface` has `blockpools` to serve a thread-local
-    // block pool to each worker.
-    // We don't have to write any codes which is equivalent to
-    // `pool_interface`, as `pool_interface` is just a simple
-    // wrapper for convinient allocating & deallocating.
-    // It can be replaced with a simple `BlockPool`.
-    pool: *mut BlockPool,
-    temp_patience: usize,
-
-    // Used for NBR+ signal optimization
-    announced_ts: AtomicUsize,
-    saved_retired_head: Option<NonNull<u8>>,
-    saved_ts: Vec<usize>,
-    first_lo_entry_flag: bool,
-    retires_since_lo_watermark: usize,
-}
-
-impl Thread {
-    pub fn new(tid: usize, num_threads: usize, max_hazptr_per_thread: usize) -> Self {
-        let pool = Box::into_raw(Box::<BlockPool>::default());
-        let retired = Box::into_raw(Box::new(BlockBag::new(pool)));
-        let proposed_hazptrs = (0..max_hazptr_per_thread)
-            .map(|_| AtomicPtr::new(null_mut()))
-            .collect();
-
-        Self {
-            tid,
-            retired,
-            proposed_len: AtomicUsize::new(0),
-            proposed_hazptrs,
-            scanned_hazptrs: RefCell::default(),
-            pool,
-            temp_patience: MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE,
-            announced_ts: AtomicUsize::new(0),
-            saved_retired_head: None,
-            saved_ts: vec![0; num_threads],
-            first_lo_entry_flag: true,
-            retires_since_lo_watermark: 0,
-        }
-    }
-
-    #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    fn retired_mut(&self) -> &mut BlockBag {
-        unsafe { &mut *self.retired }
-    }
-
-    // This out of patience decision has been improved
-    // in the latest NBR+ version on setbench.
-    #[inline]
-    fn is_out_of_patience(&mut self) -> bool {
-        if self.temp_patience == 0 {
-            self.temp_patience = MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE;
-        }
-
-        self.retired_mut().size_in_blocks() > self.temp_patience
-    }
-
-    #[inline]
-    fn is_past_lo_watermark(&mut self) -> bool {
-        cfg_if::cfg_if! {
-            // When sanitizing, reclaim more aggressively.
-            if #[cfg(sanitize = "address")] {
-                !self.retired_mut().is_empty()
-            } else {
-                (self.retired_mut().size_in_blocks() as f32
-                    > (self.temp_patience as f32 * (1.0f32 / ((self.tid % 3) + 2) as f32)))
-                    && ((self.retires_since_lo_watermark % OPS_BEFORE_TRYRECLAIM_LOWATERMARK) == 0)
-            }
-        }
-    }
-
-    #[inline]
-    fn set_lo_watermark(&mut self) {
-        self.saved_retired_head = Some(NonNull::new(self.retired_mut().peek().ptr()).unwrap());
-    }
-
-    #[inline]
-    fn send_freeable_to_pool(&mut self) {
-        let retired = self.retired_mut();
-
-        let mut spare_bag = BlockBag::new(self.pool);
-
-        if let Some(saved) = self.saved_retired_head {
-            // Reclaim due to a lo-watermark path
-            while retired.peek().ptr() != saved.as_ptr() {
-                let ret = retired.pop();
-                spare_bag.push_retired(ret);
-            }
-        }
-
-        // Deallocate freeable records.
-        // Note that even if we are on a lo-watermark path,
-        // we must check a pointer is protected or not anyway.
-        let mut reclaimed = 0;
-        while !retired.is_empty() {
-            let ret = retired.pop();
-            if self.scanned_hazptrs.borrow().contains(&ret.ptr()) {
-                spare_bag.push_retired(ret);
-            } else {
-                reclaimed += 1;
-                unsafe { ret.deallocate() };
-            }
-        }
-        stats::decr_garb(reclaimed);
-
-        // Add all collected but protected records back to `retired`
-        while !spare_bag.is_empty() {
-            retired.push_retired(spare_bag.pop());
-        }
-    }
-}
-
-impl Drop for Thread {
-    fn drop(&mut self) {
-        unsafe {
-            let mut retired = Box::from_raw(self.retired);
-            retired.deallocate_all();
-            drop(retired);
-            drop(Box::from_raw(self.pool));
-        }
-    }
-}
-
 pub struct Collector {
-    num_threads: usize,
-    threads: Vec<Thread>,
-    // Map from Thread ID into pthread_t(u64 or usize, which depends on platforms)
-    // for each registered thread
-    registered_map: Vec<Atomic<Pthread>>,
-    registered_count: AtomicUsize,
-    barrier: Barrier,
+    records: CachePadded<ThreadList>,
 }
 
 impl Collector {
-    pub fn new(num_threads: usize, max_hazptr_per_thread: usize) -> Self {
-        unsafe { recovery::install() };
-
-        let threads = (0..num_threads)
-            .map(|tid| Thread::new(tid, num_threads, max_hazptr_per_thread))
-            .collect();
-
+    pub const fn new() -> Self {
         Self {
-            num_threads,
-            threads,
-            registered_map: (0..num_threads).map(|_| Atomic::new(0)).collect(),
-            registered_count: AtomicUsize::new(0),
-            barrier: Barrier::new(num_threads),
+            records: CachePadded::new(ThreadList::new()),
         }
     }
 
-    unsafe fn restart_all_threads(&self, reclaimer: ThreadId) -> Result<(), Errno> {
-        for other_tid in 0..self.num_threads {
-            if other_tid == reclaimer {
-                continue;
+    /// Collect all pointers which are protected by at least
+    /// one of the participants.
+    pub(crate) fn collect_protected_ptrs(&self, reader: &Thread) -> FxHashSet<*mut u8> {
+        fence(Ordering::SeqCst);
+        self.records
+            .iter()
+            .flat_map(|record| record.iter_hazptrs(reader))
+            .collect()
+    }
+
+    /// Iterate all announced timestamps, which is used for *NBR+ signal optimization*.
+    ///
+    /// Note that the length of the timestamp iterator may get longer than before
+    /// because of new participants. However it is guaranteed that:
+    ///
+    /// 1. The length of the returned iterator never gets shorter.
+    /// 2. The threads that previously existed present at the same index.
+    ///    That is, the newcomers are always appended at the end of the sequence.
+    pub(crate) fn iter_announced_ts<'g>(&'g self) -> impl Iterator<Item = usize> + 'g {
+        self.records.iter().map(|record| record.load_ts())
+    }
+
+    /// Register a local `Handle` as a participant.
+    pub fn register<'c>(&'c self) -> Handle<'c> {
+        // Install a signal handler to handle the neutralization signal.
+        unsafe { recovery::install() };
+        let pthread = pthread_self();
+        Handle::new(self, self.records.acquire(pthread))
+    }
+
+    /// Unregister a local `Handle` by invalidating the inner `Thread`.
+    pub(crate) fn unregister<'c>(&'c self, thread: &'c Thread) {
+        thread.using.store(false, Ordering::Release);
+    }
+
+    pub(crate) unsafe fn restart_all_threads(&self, reclaimer: &Thread) -> Result<(), Errno> {
+        let reclaimer_tid = reclaimer.owner.load(Ordering::Acquire);
+        for thread in self.records.iter() {
+            let other_tid = thread.owner.load(Ordering::Acquire);
+            if reclaimer_tid != other_tid {
+                recovery::send_signal(other_tid)?;
             }
-            let pthread = self.registered_map[other_tid].load(Ordering::Acquire);
-            recovery::send_signal(pthread)?;
         }
         Ok(())
-    }
-
-    fn collect_all_saved_records(&self, reclaimer: ThreadId) {
-        // Set where record would be collected in.
-        let mut scanned = self.threads[reclaimer].scanned_hazptrs.borrow_mut();
-        scanned.clear();
-        fence(Ordering::SeqCst);
-
-        for other_tid in 0..self.num_threads {
-            let len = self.threads[other_tid].proposed_len.load(Ordering::Acquire);
-            for i in 0..len {
-                let hazptr = &self.threads[other_tid].proposed_hazptrs[i];
-                let ptr = hazptr.load(Ordering::Acquire);
-                scanned.insert(ptr);
-            }
-        }
-    }
-
-    fn reclaim_freeable(&mut self, reclaimer: ThreadId) {
-        self.collect_all_saved_records(reclaimer);
-        self.threads[reclaimer].send_freeable_to_pool();
-    }
-
-    pub fn register(&self) -> Guard {
-        // Initialize current thread.
-        // (ref: `initThread(tid)` in `recovery_manager.h`
-        //  from original nbr_setbench)
-        let tid = self.registered_count.fetch_add(1, Ordering::SeqCst);
-        assert!(
-            tid < self.num_threads,
-            "Attempted to exceed the maximum number of threads"
-        );
-        self.registered_map[tid].store(pthread_self(), Ordering::Release);
-
-        // Wait until all threads are ready.
-        self.barrier.wait();
-        Guard::register(self, tid)
-    }
-
-    pub fn reset_registrations(&mut self) {
-        self.registered_count.store(0, Ordering::SeqCst);
-        self.barrier = Barrier::new(self.num_threads);
     }
 }
 
 unsafe impl Send for Collector {}
 unsafe impl Sync for Collector {}
 
-const SYNC_RETIRED_COUNT_BY: usize = 32;
-
-pub struct Guard {
-    collector: *mut Collector,
-    tid: ThreadId,
-    retired_cnt_buff: Cell<usize>,
+pub(crate) struct ThreadList {
+    head: AtomicPtr<Thread>,
 }
 
-impl Guard {
-    fn register(collector: &Collector, tid: ThreadId) -> Self {
+impl ThreadList {
+    const fn new() -> Self {
         Self {
-            collector: collector as *const _ as _,
-            tid,
-            retired_cnt_buff: Cell::new(0),
+            head: AtomicPtr::new(null_mut()),
         }
     }
 
-    #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    fn coll_mut(&self) -> &mut Collector {
-        unsafe { &mut *self.collector }
-    }
-
-    #[inline(always)]
-    #[allow(clippy::mut_from_ref)]
-    fn thread_mut(&self) -> &mut Thread {
-        &mut self.coll_mut().threads[self.tid]
-    }
-
-    #[inline]
-    fn is_unprotected(&self) -> bool {
-        self.collector.is_null()
-    }
-
-    fn incr_cnt_buff(&self) -> usize {
-        let new_cnt = self.retired_cnt_buff.get() + 1;
-        self.retired_cnt_buff.set(new_cnt);
-        new_cnt
-    }
-
-    fn flush_cnt_buff(&self) {
-        let cnt = self.retired_cnt_buff.get();
-        self.retired_cnt_buff.set(0);
-        stats::incr_garb(cnt);
-    }
-
-    /// Start read phase.
-    ///
-    /// In read phase, programmers must aware following restrictions.
-    ///
-    /// 1. Reading global variables is permitted and reading shared
-    ///    records is permitted if pointers to them were obtained
-    ///    during this phase.
-    ///   - e.g., by traversing a sequence of shared objects by
-    ///     following pointers starting from a global variable—i.e., a root
-    ///
-    /// 2. Writes/CASs to shared records, writes/CASs to shared globals,
-    ///    and system calls, are **not permitted.**
-    ///
-    /// To understand the latter restriction, suppose an operation
-    /// allocates a node using malloc during its read phase, and before
-    /// it uses the node, the thread performing the operation is
-    /// neutralized. This would cause **a memory leak.**
-    ///
-    /// Additionally, writes to thread local data structures are
-    /// not recommended. To see why, suppose a thread maintains
-    /// a thread local doubly-linked list, and also updates this list
-    /// as part of the read phase of some operation on the shared data
-    /// structure. If the thread is neutralized in middle of its update
-    /// to this local list, it might corrupt the structure of the list.
-    #[inline(never)]
-    pub fn start_read(&self) {
-        if self.is_unprotected() {
-            return;
+    fn iter<'g>(&'g self) -> ThreadIter<'g> {
+        ThreadIter {
+            curr: self.head.load(Ordering::Acquire),
+            _marker: PhantomData,
         }
-
-        let thread = &mut self.coll_mut().threads[self.tid];
-        assert!(
-            !recovery::is_restartable(),
-            "restartable value should be false before starting read phase"
-        );
-
-        thread.proposed_len.store(0, Ordering::Release);
-        recovery::set_restartable(true);
     }
 
-    /// Prevent other threads from deleting the record.
-    pub fn protect<T>(&self, ptr: *mut T) {
-        if self.is_unprotected() {
-            return;
-        }
-
-        let thread = self.thread_mut();
-        let hazptr_len = thread.proposed_len.load(Ordering::Acquire);
-        if hazptr_len == thread.proposed_hazptrs.len() {
-            panic!("The hazard pointer bag is already full.");
-        }
-        compiler_fence(Ordering::SeqCst);
-
-        thread.proposed_hazptrs[hazptr_len].store(ptr as *mut _, Ordering::Release);
-        compiler_fence(Ordering::SeqCst);
-
-        thread.proposed_len.store(hazptr_len + 1, Ordering::Release);
-    }
-
-    /// End read phase.
+    /// Acquire an empty slot for a new participant.
     ///
-    /// Note that it is also equivalent to upgrading to write phase.
-    #[inline]
-    pub fn end_read(&self) {
-        if self.is_unprotected() {
-            return;
-        }
-
-        recovery::set_restartable(false);
-    }
-
-    /// Retire a pointer.
-    /// It may trigger other threads to restart.
-    ///
-    /// # Safety
-    /// * The given memory block is no longer modified.
-    /// * It is no longer possible to reach the block from
-    ///   the data structure.
-    /// * The same block is not retired more than once.
-    pub unsafe fn retire<T>(&self, ptr: *mut T) {
-        if self.is_unprotected() {
-            drop(Box::from_raw(ptr));
-            return;
-        }
-
-        let cnt_buff = self.incr_cnt_buff();
-        let collector = self.coll_mut();
-        let num_threads = collector.num_threads;
-
-        if self.thread_mut().is_out_of_patience() {
-            // Tell other threads that I'm starting signaling.
-            self.thread_mut()
-                .announced_ts
-                .fetch_add(1, Ordering::SeqCst);
-            compiler_fence(Ordering::SeqCst);
-
-            if let Err(err) = collector.restart_all_threads(self.tid) {
-                panic!("Failed to restart other threads: {err}");
-            } else {
-                // Tell other threads that I have done signaling.
-                self.thread_mut()
-                    .announced_ts
-                    .fetch_add(1, Ordering::SeqCst);
-
-                self.flush_cnt_buff();
-
-                // Full bag shall be reclaimed so clear any bag head.
-                // Avoiding changes to arg of this reclaim_freeable.
-                self.thread_mut().saved_retired_head = None;
-                collector.reclaim_freeable(self.tid);
-
-                self.thread_mut().first_lo_entry_flag = true;
-                self.thread_mut().retires_since_lo_watermark = 0;
-
-                for i in 0..num_threads {
-                    self.thread_mut().saved_ts[i] = 0;
-                }
-            }
-        } else if self.thread_mut().is_past_lo_watermark() {
-            // On the first entry to lo-path, I shall save my baghead.
-            // Up to this baghead, I can reclaim upon detecting that someone
-            // has started and finished signalling after I saved Baghead.
-            // That is a condition where all threads have gone Quiescent
-            // at least once after I saved my baghead.
-            if self.thread_mut().first_lo_entry_flag {
-                self.thread_mut().first_lo_entry_flag = false;
-                self.thread_mut().set_lo_watermark();
-
-                // Take a snapshot of all other announce_ts,
-                // to be used to know if its time to reclaim at lo-path.
-                for i in 0..num_threads {
-                    let ts = collector.threads[i].announced_ts.load(Ordering::SeqCst);
-                    self.thread_mut().saved_ts[i] = ts + (ts % 2);
-                }
-            }
-
-            for i in 0..num_threads {
-                if collector.threads[i].announced_ts.load(Ordering::SeqCst)
-                    >= self.thread_mut().saved_ts[i] + 2
-                {
-                    self.flush_cnt_buff();
-
-                    // If the baghead is not `None`, then reclamation shall happen
-                    // from the baghead to tail in functions depicting reclamation of lo-watermark path.
-                    collector.reclaim_freeable(self.tid);
-
-                    self.thread_mut().first_lo_entry_flag = true;
-                    self.thread_mut().retires_since_lo_watermark = 0;
-                    for j in 0..num_threads {
-                        self.thread_mut().saved_ts[j] = 0;
+    /// If there is an available slot, it returns a reference to that slot.
+    /// Otherwise, it tries to append a new slot at the end of the list,
+    /// and if it succeeds, returns the allocated slot.
+    pub fn acquire<'c>(&'c self, tid: Pthread) -> &'c Thread {
+        let mut prev_link = &self.head;
+        let thread = loop {
+            match unsafe { prev_link.load(Ordering::Acquire).as_ref() } {
+                Some(curr) => {
+                    if !curr.using.load(Ordering::Acquire)
+                        && curr
+                            .using
+                            .compare_exchange(false, true, Ordering::Release, Ordering::Relaxed)
+                            .is_ok()
+                    {
+                        break curr;
                     }
-                    break;
+                    prev_link = &curr.next;
+                }
+                None => {
+                    let new_thread = Box::into_raw(Box::new(Thread::new(true)));
+                    if prev_link
+                        .compare_exchange(
+                            null_mut(),
+                            new_thread,
+                            Ordering::Release,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        break unsafe { &*new_thread };
+                    } else {
+                        unsafe { drop(Box::from_raw(new_thread)) };
+                    }
                 }
             }
-        }
-
-        if !self.thread_mut().first_lo_entry_flag {
-            self.thread_mut().retires_since_lo_watermark += 1;
-        }
-
-        self.thread_mut().retired_mut().push(ptr);
-
-        if cnt_buff % SYNC_RETIRED_COUNT_BY == 0 {
-            self.flush_cnt_buff();
-        }
+        };
+        thread.owner.store(tid, Ordering::Release);
+        thread
     }
 }
 
-/// Get a dummy `Guard` associated with no collector.
-///
-/// In a dummy `Guard`, `start_read`, `end_read` and `protect`
-/// have no effect, and `retire` reclaims a block immediately.
-///
-/// # Safety
-///
-/// Use the unprotected `Guard` only if the data structure
-/// is not accessed concurrently.
-pub unsafe fn unprotected() -> &'static Guard {
-    struct GuardWrapper(Guard);
-    unsafe impl Sync for GuardWrapper {}
-    static UNPROTECTED: GuardWrapper = GuardWrapper(Guard {
-        collector: null_mut(),
-        tid: 0,
-        retired_cnt_buff: Cell::new(0),
-    });
-    &UNPROTECTED.0
+struct ThreadIter<'g> {
+    curr: *const Thread,
+    _marker: PhantomData<&'g ()>,
 }
 
-#[cfg(test)]
-mod tests {
-    use super::Collector;
-    use crate::{read_phase, recovery::is_restartable};
-    use crossbeam_utils::thread;
-    use std::{
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
-        },
-        time::Duration,
-    };
+impl<'g> Iterator for ThreadIter<'g> {
+    type Item = &'g Thread;
 
-    const THREADS: usize = 16;
-
-    #[test]
-    fn restart_all() {
-        let collector = Arc::new(Collector::new(THREADS + 1, 1));
-        let started = Arc::new(AtomicUsize::new(0));
-
-        thread::scope(|s| {
-            for _ in 0..THREADS {
-                let collector = Arc::clone(&collector);
-                let started = Arc::clone(&started);
-
-                s.spawn(move |_| {
-                    let guard = collector.register();
-                    assert!(!is_restartable());
-
-                    read_phase!(guard; [] => {
-                        if started.fetch_add(1, Ordering::SeqCst) < THREADS {
-                            assert!(is_restartable());
-                            loop {
-                                std::thread::sleep(Duration::from_micros(1))
-                            }
-                        }
-                    });
-                });
+    fn next(&mut self) -> Option<Self::Item> {
+        while let Some(curr_ref) = unsafe { self.curr.as_ref() } {
+            self.curr = curr_ref.next.load(Ordering::Acquire);
+            if curr_ref.using.load(Ordering::Acquire) {
+                return Some(curr_ref);
             }
+        }
+        None
+    }
+}
 
-            let guard = collector.register();
-            while started.load(Ordering::SeqCst) < THREADS {
-                std::thread::sleep(Duration::from_micros(1));
+pub(crate) struct Thread {
+    next: AtomicPtr<Thread>,
+    using: AtomicBool,
+    owner: Atomic<Pthread>,
+    // A special hazard pointer slot to protect `hazards`
+    // before iterating its contents.
+    hazptr_for_iter: AtomicPtr<u8>,
+    // The owner thread may resize its hazard pointer array `hazards`
+    // by allocating new vector and overwriting the pointer.
+    // For this reason, it is important for reclaimer to protect `hazards`
+    // before reading its contents to avoid use-after-free.
+    hazards: AtomicPtr<Vec<AtomicPtr<u8>>>,
+    // Used for NBR+ signal optimization
+    announced_ts: AtomicUsize,
+}
+
+impl Thread {
+    fn new(using: bool) -> Self {
+        let hazards_vec =
+            Vec::from(unsafe { core::mem::zeroed::<[AtomicPtr<u8>; INITIAL_HAZPTR_CAP]>() });
+        let hazards = AtomicPtr::new(Box::into_raw(Box::new(hazards_vec)));
+        Self {
+            next: AtomicPtr::new(null_mut()),
+            using: AtomicBool::new(using),
+            owner: unsafe { core::mem::zeroed() },
+            hazptr_for_iter: AtomicPtr::new(null_mut()),
+            hazards,
+            announced_ts: AtomicUsize::new(0),
+        }
+    }
+
+    fn iter_hazptrs<'g>(&'g self, reader: &'g Thread) -> HazardIter<'g> {
+        // Protect `hazards` properly before reading it.
+        let mut ptr = self.hazards.load(Ordering::Relaxed);
+        loop {
+            reader
+                .hazptr_for_iter
+                .store(ptr as *mut _, Ordering::Release);
+            fence(Ordering::SeqCst);
+            let new_ptr = self.hazards.load(Ordering::Acquire);
+            if ptr == new_ptr {
+                break;
             }
-            unsafe { collector.restart_all_threads(guard.tid).unwrap() };
-        })
-        .unwrap();
+            ptr = new_ptr;
+        }
+
+        HazardIter {
+            curr: &self.hazptr_for_iter,
+            hazards: unsafe { &*ptr },
+            next_idx: 0,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn slots<'g>(&'g self) -> &'g [AtomicPtr<u8>] {
+        unsafe { &*self.hazards.load(Ordering::Acquire) }
+    }
+
+    #[inline]
+    pub(crate) fn load_ts(&self) -> usize {
+        self.announced_ts.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn advance_ts(&self) {
+        self.announced_ts.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+struct HazardIter<'g> {
+    curr: &'g AtomicPtr<u8>,
+    hazards: &'g [AtomicPtr<u8>],
+    next_idx: usize,
+}
+
+impl<'g> Iterator for HazardIter<'g> {
+    type Item = *mut u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.next_idx >= self.hazards.len() {
+            return None;
+        }
+        let curr_ptr = self.curr.load(Ordering::Acquire);
+        if self.next_idx < self.hazards.len() {
+            self.curr = &self.hazards[self.next_idx];
+            self.next_idx += 1;
+        }
+        Some(curr_ptr)
     }
 }

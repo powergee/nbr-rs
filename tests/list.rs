@@ -1,6 +1,6 @@
 #![feature(strict_provenance_atomic_ptr)]
 
-use nbr_rs::{read_phase, Guard};
+use nbr_rs::{Guard, Handle};
 use std::cmp::Ordering::{Equal, Greater, Less};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::{mem, ptr};
@@ -50,7 +50,6 @@ macro_rules! some_or {
     }};
 }
 
-#[derive(Debug)]
 struct Node<K, V> {
     next: AtomicPtr<Node<K, V>>,
     key: K,
@@ -85,10 +84,19 @@ impl<K, V> Node<K, V> {
     }
 }
 
-struct Cursor<K, V> {
+struct Cursor<'g, K, V> {
     prev: *mut Node<K, V>,
+    prev_link: &'g AtomicPtr<Node<K, V>>,
+    prev_next: *mut Node<K, V>,
     curr: *mut Node<K, V>,
     found: bool,
+}
+
+impl<'g, K, V> nbr_rs::Cursor for Cursor<'g, K, V> {
+    fn protect_with(&self, guard: &mut Guard) {
+        guard.protect(untagged(self.prev));
+        guard.protect(untagged(self.curr));
+    }
 }
 
 impl<K, V> List<K, V>
@@ -103,22 +111,21 @@ where
 
     // Traverse the Harris List.
     // Clean up a chain of logically removed nodes in each traversal.
-    fn search(&self, key: &K, guard: &Guard) -> Cursor<K, V> {
-        let mut cursor = Cursor {
-            prev: ptr::null_mut(),
-            curr: ptr::null_mut(),
-            found: false,
-        };
-        let mut prev_next;
-
+    fn search(&self, key: &K, handle: &mut Handle) -> Cursor<K, V> {
         loop {
-            read_phase!(guard; [cursor.prev, cursor.curr] => {
-                cursor.prev = &self.head as *const _ as *mut Node<K, V>;
-                cursor.curr = self.head.load(Ordering::Acquire);
-                prev_next = cursor.curr;
+            let cursor = handle.read_phase(|_| {
+                let mut cursor = Cursor {
+                    prev: ptr::null_mut(),
+                    prev_link: &self.head,
+                    prev_next: self.head.load(Ordering::Acquire),
+                    curr: ptr::null_mut(),
+                    found: false,
+                };
+                cursor.curr = cursor.prev_next;
 
                 cursor.found = loop {
-                    let curr_node = some_or!(unsafe { untagged(cursor.curr).as_ref() }, break false);
+                    let curr_node =
+                        some_or!(unsafe { untagged(cursor.curr).as_ref() }, break false);
                     let next = curr_node.next.load(Ordering::Acquire);
 
                     if tag(next) != 0 {
@@ -129,32 +136,38 @@ where
                     match curr_node.key.cmp(key) {
                         Less => {
                             cursor.prev = cursor.curr;
+                            cursor.prev_link = &curr_node.next;
+                            cursor.prev_next = next;
                             cursor.curr = next;
-                            prev_next = next;
                         }
                         Equal => break true,
                         Greater => break false,
                     }
                 };
+                cursor
             });
 
-            if prev_next == cursor.curr {
+            if cursor.prev_next == cursor.curr {
                 return cursor;
             }
 
-            let prev_ref = unsafe { &*cursor.prev };
-            if prev_ref
-                .next
-                .compare_exchange(prev_next, cursor.curr, Ordering::Release, Ordering::Relaxed)
+            if cursor
+                .prev_link
+                .compare_exchange(
+                    cursor.prev_next,
+                    cursor.curr,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
                 .is_err()
             {
                 continue;
             }
 
-            let mut node = prev_next;
+            let mut node = cursor.prev_next;
             while tagged(node, 0) != cursor.curr {
                 let next = unsafe { &*untagged(node) }.next.load(Ordering::Acquire);
-                unsafe { guard.retire(untagged(node)) };
+                unsafe { handle.retire(untagged(node)) };
                 node = next;
             }
 
@@ -162,8 +175,8 @@ where
         }
     }
 
-    pub fn get<'g>(&'g self, key: &K, guard: &'g Guard) -> Option<&'g V> {
-        let cursor = self.search(key, guard);
+    pub fn get<'g>(&'g self, key: &K, handle: &'g mut Handle) -> Option<&'g V> {
+        let cursor = self.search(key, handle);
         if cursor.found {
             unsafe { cursor.curr.as_ref() }.map(|n| &n.value)
         } else {
@@ -171,10 +184,10 @@ where
         }
     }
 
-    pub fn insert(&self, key: K, value: V, guard: &Guard) -> Result<(), (K, V)> {
+    pub fn insert(&self, key: K, value: V, handle: &mut Handle) -> Result<(), (K, V)> {
         let mut new_node = Box::new(Node::new(key, value));
         loop {
-            let cursor = self.search(&new_node.key, guard);
+            let cursor = self.search(&new_node.key, handle);
             if cursor.found {
                 return Err((new_node.key, new_node.value));
             }
@@ -182,7 +195,7 @@ where
             new_node.next.store(cursor.curr, Ordering::Relaxed);
             let new_node_ptr = Box::into_raw(new_node);
 
-            match unsafe { &*cursor.prev }.next.compare_exchange(
+            match cursor.prev_link.compare_exchange(
                 cursor.curr,
                 new_node_ptr,
                 Ordering::Release,
@@ -194,26 +207,25 @@ where
         }
     }
 
-    pub fn remove<'g>(&'g self, key: &K, guard: &'g Guard) -> Option<&'g V> {
+    pub fn remove<'g>(&'g self, key: &K, handle: &'g mut Handle) -> Option<&'g V> {
         loop {
-            let cursor = self.search(key, guard);
+            let cursor = self.search(key, handle);
             if !cursor.found {
                 return None;
             }
 
             let curr_node = unsafe { &*cursor.curr };
-            let next = curr_node.next.fetch_or(1, Ordering::Acquire);
+            let next = curr_node.next.fetch_or(1, Ordering::AcqRel);
             if tag(next) == 1 {
                 continue;
             }
 
-            let prev_ref = unsafe { &*cursor.prev };
-            if prev_ref
-                .next
+            if cursor
+                .prev_link
                 .compare_exchange(cursor.curr, next, Ordering::Release, Ordering::Relaxed)
                 .is_ok()
             {
-                unsafe { guard.retire(cursor.curr) };
+                unsafe { handle.retire(cursor.curr) };
             }
             return Some(&curr_node.value);
         }
@@ -236,45 +248,41 @@ mod tests {
     #[test]
     fn smoke_list() {
         let map = &List::new();
-        let collector = Arc::new(Collector::new(THREADS, 2));
+        let collector = Arc::new(Collector::new());
 
         thread::scope(|s| {
             for t in 0..THREADS {
                 let collector = Arc::clone(&collector);
                 s.spawn(move |_| {
-                    let guard = collector.register();
+                    let mut guard = collector.register();
                     let mut rng = rand::thread_rng();
                     let mut keys: Vec<usize> =
                         (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
                     keys.shuffle(&mut rng);
                     for i in keys {
-                        assert!(map.insert(i, i.to_string(), &guard).is_ok());
+                        assert!(map.insert(i, i.to_string(), &mut guard).is_ok());
                     }
                 });
             }
         })
         .unwrap();
 
-        let mut collector = Arc::try_unwrap(collector).unwrap_or_else(|_| panic!());
-        collector.reset_registrations();
-        let collector = Arc::new(collector);
-
         thread::scope(|s| {
             for t in 0..THREADS {
                 let collector = Arc::clone(&collector);
                 s.spawn(move |_| {
-                    let guard = collector.register();
+                    let mut guard = collector.register();
                     let mut rng = rand::thread_rng();
                     let mut keys: Vec<usize> =
                         (0..ELEMENTS_PER_THREADS).map(|k| k * THREADS + t).collect();
                     keys.shuffle(&mut rng);
                     if t < THREADS / 2 {
                         for i in keys {
-                            assert_eq!(i.to_string(), *map.remove(&i, &guard).unwrap());
+                            assert_eq!(i.to_string(), *map.remove(&i, &mut guard).unwrap());
                         }
                     } else {
                         for i in keys {
-                            assert_eq!(i.to_string(), *map.get(&i, &guard).unwrap());
+                            assert_eq!(i.to_string(), *map.get(&i, &mut guard).unwrap());
                         }
                     }
                 });

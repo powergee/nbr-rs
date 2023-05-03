@@ -15,8 +15,10 @@ thread_local! {
     static RESTARTABLE: AtomicBool = AtomicBool::new(false);
 }
 
-/// Install a process-wide signal handler.
-/// Note that we don't have to call `sigaction` for every child thread.
+/// Install a signal handler.
+///
+/// Note that if a signal handler is installed for the parent thread
+/// before spawning childs, we don't have to call `sigaction` for every child thread.
 ///
 /// By default, SIGUSR1 is used as a neutralize signal.
 /// To use the other signal, use `set_neutralize_signal`.
@@ -96,7 +98,7 @@ pub unsafe fn set_neutralize_signal(signal: Signal) {
 /// other internal functions.
 /// It is not recommended to access this manually.
 #[inline]
-pub fn jmp_buf() -> *mut sigjmp_buf {
+pub(crate) fn jmp_buf() -> *mut sigjmp_buf {
     JMP_BUF.with(|buf| buf.borrow_mut().as_mut_ptr())
 }
 
@@ -105,9 +107,22 @@ extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {
         return;
     }
 
-    let buf = JMP_BUF.with(|buf| buf.borrow_mut().as_mut_ptr());
+    let buf = jmp_buf();
     set_restartable(false);
     compiler_fence(Ordering::SeqCst);
 
     unsafe { siglongjmp(buf, 1) };
+}
+
+/// Perform `siglongjmp` without changing any phase-related variables
+/// like `RESTARTABLE`.
+///
+/// It assume that the `jmp_buf` is properly initialized
+/// by calling `siglongjmp`
+#[inline]
+pub(crate) unsafe fn longjmp_manually() -> ! {
+    let buf = jmp_buf();
+    compiler_fence(Ordering::SeqCst);
+
+    siglongjmp(buf, 1)
 }
