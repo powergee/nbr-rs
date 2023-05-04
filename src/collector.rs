@@ -1,4 +1,5 @@
 use std::{
+    cell::{RefCell, RefMut},
     marker::PhantomData,
     ptr::null_mut,
     sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize},
@@ -17,6 +18,11 @@ use crate::handle::Handle;
 use crate::recovery;
 
 const INITIAL_HAZPTR_CAP: usize = 16;
+
+#[cfg(not(sanitize = "address"))]
+pub(crate) const MAX_RINGBAG_CAPACITY_POW2: usize = 256;
+#[cfg(sanitize = "address")]
+pub(crate) const MAX_RINGBAG_CAPACITY_POW2: usize = 8;
 
 const_assert!(Atomic::<Pthread>::is_lock_free());
 
@@ -81,6 +87,7 @@ impl Collector {
 unsafe impl Send for Collector {}
 unsafe impl Sync for Collector {}
 
+/// A grow-only linked list for thread registration.
 pub(crate) struct ThreadList {
     head: AtomicPtr<Thread>,
 }
@@ -184,6 +191,8 @@ pub(crate) struct Thread {
     hazards: AtomicPtr<Vec<AtomicPtr<u8>>>,
     // Used for NBR+ signal optimization
     announced_ts: AtomicUsize,
+    // Retired records collected by a `retire` operation
+    retired: RefCell<Vec<Retired>>,
 }
 
 impl Thread {
@@ -198,6 +207,7 @@ impl Thread {
             hazptr_for_iter: AtomicPtr::new(null_mut()),
             hazards,
             announced_ts: AtomicUsize::new(0),
+            retired: RefCell::new(Vec::with_capacity(MAX_RINGBAG_CAPACITY_POW2)),
         }
     }
 
@@ -229,6 +239,11 @@ impl Thread {
     }
 
     #[inline]
+    pub(crate) fn retired_mut<'g>(&'g self) -> RefMut<'g, Vec<Retired>> {
+        self.retired.borrow_mut()
+    }
+
+    #[inline]
     pub(crate) fn load_ts(&self) -> usize {
         self.announced_ts.load(Ordering::Acquire)
     }
@@ -241,7 +256,13 @@ impl Thread {
 
 impl Drop for Thread {
     fn drop(&mut self) {
+        // `Thread` is dropped when `Collector` is dropped.
+        // So, we can safely deallocate all retired records
+        // because all threads have finished their jobs and exited.
         unsafe { drop(Box::from_raw(self.hazards.load(Ordering::Acquire))) };
+        for ret in self.retired.take().drain(..) {
+            unsafe { ret.deallocate() };
+        }
     }
 }
 
@@ -265,4 +286,39 @@ impl<'g> Iterator for HazardIter<'g> {
         }
         Some(curr_ptr)
     }
+}
+
+pub(crate) struct Retired {
+    ptr: *mut u8,
+    deleter: unsafe fn(*mut u8),
+}
+
+impl Default for Retired {
+    fn default() -> Self {
+        Self {
+            ptr: null_mut(),
+            deleter: free::<u8>,
+        }
+    }
+}
+
+impl Retired {
+    pub fn new<T>(ptr: *mut T) -> Self {
+        Self {
+            ptr: ptr as *mut u8,
+            deleter: free::<T>,
+        }
+    }
+
+    pub fn ptr(&self) -> *mut u8 {
+        self.ptr
+    }
+
+    pub unsafe fn deallocate(self) {
+        (self.deleter)(self.ptr);
+    }
+}
+
+unsafe fn free<T>(ptr: *mut u8) {
+    drop(Box::from_raw(ptr as *mut T));
 }

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefMut,
     marker::PhantomData,
     ptr::NonNull,
     sync::atomic::{compiler_fence, AtomicPtr},
@@ -9,20 +10,12 @@ use nix::sys::signal::{pthread_sigmask, SigSet, SigmaskHow};
 use rustc_hash::FxHashSet;
 
 use crate::{
-    block_bag::{BlockBag, BlockPool, BLOCK_SIZE},
-    collector::Thread,
-    recovery, stats, Collector,
+    collector::{Retired, Thread},
+    recovery, stats, Collector, MAX_RINGBAG_CAPACITY_POW2,
 };
 
 #[allow(unused)]
 const OPS_BEFORE_TRYRECLAIM_LOWATERMARK: usize = 32;
-#[cfg(not(sanitize = "address"))]
-const MAX_RINGBAG_CAPACITY_POW2: usize = 256;
-#[cfg(sanitize = "address")]
-const MAX_RINGBAG_CAPACITY_POW2: usize = 8;
-
-const PATIENCE: usize = MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE;
-
 const SYNC_RETIRED_COUNT_BY: usize = 32;
 
 pub struct Handle<'c> {
@@ -30,18 +23,7 @@ pub struct Handle<'c> {
     pub(crate) thread: &'c Thread,
 
     // Retired records collected by a delete operation
-    retired: *mut BlockBag,
-    // A helper to allocate and recycle blocks
-    //
-    // In the original implementation, `reclaimer_nbr` has
-    // `pool` as a member, which is a subclass of `pool_interface`.
-    // And `pool_interface` has `blockpools` to serve a thread-local
-    // block pool to each worker.
-    // We don't have to write any codes which is equivalent to
-    // `pool_interface`, as `pool_interface` is just a simple
-    // wrapper for convinient allocating & deallocating.
-    // It can be replaced with a simple `BlockPool`.
-    pool: *mut BlockPool,
+    retired: RefMut<'c, Vec<Retired>>,
 
     // Used for NBR+ signal optimization
     saved_retired_head: Option<NonNull<u8>>,
@@ -54,23 +36,16 @@ pub struct Handle<'c> {
 
 impl<'c> Handle<'c> {
     pub(crate) fn new(collector: &'c Collector, thread: &'c Thread) -> Self {
-        let pool = Box::into_raw(Box::<BlockPool>::default());
         Self {
             collector,
             thread,
-            retired: Box::into_raw(Box::new(BlockBag::new(pool))),
-            pool,
+            retired: thread.retired_mut(),
             saved_retired_head: None,
             saved_ts: Vec::new(),
             first_lo_entry_flag: true,
             retires_since_lo_watermark: 0,
             retired_cnt_buff: 0,
         }
-    }
-
-    #[inline(always)]
-    fn retired_mut(&mut self) -> &mut BlockBag {
-        unsafe { &mut *self.retired }
     }
 
     #[inline]
@@ -87,7 +62,7 @@ impl<'c> Handle<'c> {
 
     #[inline]
     fn is_out_of_patience(&mut self) -> bool {
-        self.retired_mut().size_in_blocks() > PATIENCE
+        self.retired.len() >= MAX_RINGBAG_CAPACITY_POW2
     }
 
     #[inline]
@@ -95,10 +70,10 @@ impl<'c> Handle<'c> {
         cfg_if::cfg_if! {
             // When sanitizing, reclaim more aggressively.
             if #[cfg(sanitize = "address")] {
-                !self.retired_mut().is_empty()
+                !self.retired.is_empty()
             } else {
-                (self.retired_mut().size_in_blocks() as f32
-                    > (PATIENCE as f32 / 3.0f32))
+                (self.retired.len() as f32
+                    > (MAX_RINGBAG_CAPACITY_POW2 as f32 / 3.0f32))
                     && ((self.retires_since_lo_watermark % OPS_BEFORE_TRYRECLAIM_LOWATERMARK) == 0)
             }
         }
@@ -106,19 +81,18 @@ impl<'c> Handle<'c> {
 
     #[inline]
     fn set_lo_watermark(&mut self) {
-        self.saved_retired_head = Some(NonNull::new(self.retired_mut().peek().ptr()).unwrap());
+        self.saved_retired_head = Some(NonNull::new(self.retired.last().unwrap().ptr()).unwrap());
     }
 
     #[inline]
     fn send_freeable_to_pool(&mut self, scanned_hazptrs: FxHashSet<*mut u8>) {
-        let mut spare_bag = BlockBag::new(self.pool);
+        let mut spare_bag = Vec::with_capacity(MAX_RINGBAG_CAPACITY_POW2 / 3 + 1);
 
         if let Some(saved) = self.saved_retired_head {
-            let retired = self.retired_mut();
             // Reclaim due to a lo-watermark path
-            while retired.peek().ptr() != saved.as_ptr() {
-                let ret = retired.pop();
-                spare_bag.push_retired(ret);
+            while self.retired.last().unwrap().ptr() != saved.as_ptr() {
+                let ret = self.retired.pop().unwrap();
+                spare_bag.push(ret);
             }
         }
 
@@ -126,11 +100,9 @@ impl<'c> Handle<'c> {
         // Note that even if we are on a lo-watermark path,
         // we must check a pointer is protected or not anyway.
         let mut reclaimed = 0;
-        let retired = self.retired_mut();
-        while !retired.is_empty() {
-            let ret = retired.pop();
+        while let Some(ret) = self.retired.pop() {
             if scanned_hazptrs.contains(&ret.ptr()) {
-                spare_bag.push_retired(ret);
+                spare_bag.push(ret);
             } else {
                 reclaimed += 1;
                 unsafe { ret.deallocate() };
@@ -139,9 +111,7 @@ impl<'c> Handle<'c> {
         stats::decr_garb(reclaimed);
 
         // Add all collected but protected records back to `retired`
-        while !spare_bag.is_empty() {
-            retired.push_retired(spare_bag.pop());
-        }
+        self.retired.append(&mut spare_bag);
     }
 
     fn reclaim_freeable(&mut self) {
@@ -349,7 +319,7 @@ impl<'c> Handle<'c> {
             self.retires_since_lo_watermark += 1;
         }
 
-        self.retired_mut().push(ptr);
+        self.retired.push(Retired::new(ptr));
 
         if cnt_buff % SYNC_RETIRED_COUNT_BY == 0 {
             self.flush_cnt_buff();
@@ -359,14 +329,11 @@ impl<'c> Handle<'c> {
 
 impl<'c> Drop for Handle<'c> {
     fn drop(&mut self) {
-        unsafe {
-            let mut retired = Box::from_raw(self.retired);
-            retired.deallocate_all();
-            drop(retired);
-            drop(Box::from_raw(self.pool));
-        }
         self.flush_cnt_buff();
         self.collector.unregister(&mut self.thread);
+        // Flush current write buffers to make changes on `retired`
+        // visible to other threads.
+        fence(Ordering::SeqCst);
     }
 }
 

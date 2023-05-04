@@ -1,6 +1,5 @@
 #![feature(cfg_sanitize)]
 #![feature(core_intrinsics)]
-mod block_bag;
 mod collector;
 mod handle;
 mod recovery;
