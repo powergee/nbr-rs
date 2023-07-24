@@ -19,12 +19,6 @@ use crate::stats;
 
 const_assert!(Atomic::<Pthread>::is_lock_free());
 
-const OPS_BEFORE_TRYRECLAIM_LOWATERMARK: usize = 32;
-#[cfg(not(sanitize = "address"))]
-const MAX_RINGBAG_CAPACITY_POW2: usize = 256;
-#[cfg(sanitize = "address")]
-const MAX_RINGBAG_CAPACITY_POW2: usize = 8;
-
 /// 0-indexed thread identifier.
 /// Note that this ThreadId is not same with pthread_t,
 /// and it is used for only NBR internally.
@@ -32,6 +26,7 @@ pub type ThreadId = usize;
 
 /// Thread-local variables of NBR+
 struct Thread {
+    #[allow(unused)]
     tid: ThreadId,
     // Retired records collected by a delete operation
     retired: *mut BlockBag,
@@ -54,7 +49,8 @@ struct Thread {
     // wrapper for convinient allocating & deallocating.
     // It can be replaced with a simple `BlockPool`.
     pool: *mut BlockPool,
-    temp_patience: usize,
+    capacity: usize,
+    lowatermark: usize,
 
     // Used for NBR+ signal optimization
     announced_ts: AtomicUsize,
@@ -65,7 +61,13 @@ struct Thread {
 }
 
 impl Thread {
-    pub fn new(tid: usize, num_threads: usize, max_hazptr_per_thread: usize) -> Self {
+    pub fn new(
+        tid: usize,
+        num_threads: usize,
+        max_hazptr_per_thread: usize,
+        bag_cap_pow2: usize,
+        lowatermark: usize,
+    ) -> Self {
         let pool = Box::into_raw(Box::<BlockPool>::default());
         let retired = Box::into_raw(Box::new(BlockBag::new(pool)));
         let proposed_hazptrs = (0..max_hazptr_per_thread)
@@ -79,7 +81,8 @@ impl Thread {
             proposed_hazptrs,
             scanned_hazptrs: RefCell::default(),
             pool,
-            temp_patience: MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE,
+            capacity: bag_cap_pow2 / BLOCK_SIZE,
+            lowatermark,
             announced_ts: AtomicUsize::new(0),
             saved_retired_head: None,
             saved_ts: vec![0; num_threads],
@@ -98,11 +101,7 @@ impl Thread {
     // in the latest NBR+ version on setbench.
     #[inline]
     fn is_out_of_patience(&mut self) -> bool {
-        if self.temp_patience == 0 {
-            self.temp_patience = MAX_RINGBAG_CAPACITY_POW2 / BLOCK_SIZE;
-        }
-
-        self.retired_mut().size_in_blocks() > self.temp_patience
+        self.retired_mut().size_in_blocks() > self.capacity
     }
 
     #[inline]
@@ -112,9 +111,10 @@ impl Thread {
             if #[cfg(sanitize = "address")] {
                 !self.retired_mut().is_empty()
             } else {
-                (self.retired_mut().size_in_blocks() as f32
-                    > (self.temp_patience as f32 * (1.0f32 / ((self.tid % 3) + 2) as f32)))
-                    && ((self.retires_since_lo_watermark % OPS_BEFORE_TRYRECLAIM_LOWATERMARK) == 0)
+                let blocks = self.retired_mut().size_in_blocks();
+                (blocks as f32
+                    > (self.capacity as f32 * (1.0f32 / ((self.tid % 3) + 2) as f32)))
+                && ((self.retires_since_lo_watermark % self.lowatermark) == 0)
             }
         }
     }
@@ -182,11 +182,25 @@ pub struct Collector {
 }
 
 impl Collector {
-    pub fn new(num_threads: usize, max_hazptr_per_thread: usize) -> Self {
+    pub fn new(
+        num_threads: usize,
+        max_hazptr_per_thread: usize,
+        bag_cap_pow2: usize,
+        lowatermark: usize,
+    ) -> Self {
+        assert!(bag_cap_pow2.count_ones() == 1);
         unsafe { recovery::install() };
 
         let threads = (0..num_threads)
-            .map(|tid| Thread::new(tid, num_threads, max_hazptr_per_thread))
+            .map(|tid| {
+                Thread::new(
+                    tid,
+                    num_threads,
+                    max_hazptr_per_thread,
+                    bag_cap_pow2,
+                    lowatermark,
+                )
+            })
             .collect();
 
         Self {
@@ -506,7 +520,7 @@ mod tests {
 
     #[test]
     fn restart_all() {
-        let collector = Arc::new(Collector::new(THREADS + 1, 1));
+        let collector = Arc::new(Collector::new(THREADS + 1, 1, 128, 32));
         let started = Arc::new(AtomicUsize::new(0));
 
         thread::scope(|s| {

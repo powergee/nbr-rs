@@ -1,4 +1,5 @@
 use core::{mem, ptr};
+use std::mem::{transmute, MaybeUninit};
 
 pub(crate) struct BlockBag {
     size_in_blocks: usize,
@@ -149,19 +150,7 @@ impl BlockPool {
     }
 }
 
-// In the original implementaion, a size of Block is defined as
-// (BLOCK_SIZE_DESIRED_BYTES/sizeof(T*)-3), where BLOCK_SIZE_DESIRED_BYTES is 512.
-// ("-3" is presented becuase there are other three 8-byte members.)
-// And it is approximately 61 because Block::data was a vector of pointers.
-//
-// For our implementation, Block::data also holds deleters for each record,
-// so BLOCK_SIZE_DESIRED_BYTES must be divided by 16.
-#[cfg(not(sanitize = "address"))]
-pub(crate) const BLOCK_SIZE_DESIRED_BYTES: usize = 512;
-#[cfg(sanitize = "address")]
-pub(crate) const BLOCK_SIZE_DESIRED_BYTES: usize = 64;
-
-pub(crate) const BLOCK_SIZE: usize = BLOCK_SIZE_DESIRED_BYTES / 16 - 2;
+pub const BLOCK_SIZE: usize = 64;
 
 pub(crate) struct Block {
     next: *mut Block,
@@ -171,10 +160,14 @@ pub(crate) struct Block {
 
 impl Block {
     pub fn new(next: *mut Block) -> Self {
+        let mut data: [MaybeUninit<Retired>; BLOCK_SIZE] = unsafe { mem::zeroed() };
+        for slot in &mut data {
+            slot.write(Retired::default());
+        }
         Self {
             next,
             size: 0,
-            data: Default::default(),
+            data: unsafe { transmute(data) },
         }
     }
 
