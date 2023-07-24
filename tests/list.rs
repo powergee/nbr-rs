@@ -236,7 +236,7 @@ mod tests {
     #[test]
     fn smoke_list() {
         let map = &List::new();
-        let collector = Arc::new(Collector::new(THREADS, 2));
+        let collector = Arc::new(Collector::new(THREADS, 2, 256, 32));
 
         thread::scope(|s| {
             for t in 0..THREADS {

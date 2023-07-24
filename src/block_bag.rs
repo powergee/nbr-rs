@@ -150,7 +150,7 @@ impl BlockPool {
     }
 }
 
-pub const BLOCK_SIZE: usize = 64;
+pub const BLOCK_SIZE: usize = 30;
 
 pub(crate) struct Block {
     next: *mut Block,

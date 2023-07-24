@@ -520,7 +520,7 @@ mod tests {
 
     #[test]
     fn restart_all() {
-        let collector = Arc::new(Collector::new(THREADS + 1, 1, 128, 32));
+        let collector = Arc::new(Collector::new(THREADS + 1, 1, 256, 32));
         let started = Arc::new(AtomicUsize::new(0));
 
         thread::scope(|s| {
