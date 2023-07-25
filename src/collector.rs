@@ -50,6 +50,7 @@ struct Thread {
     // It can be replaced with a simple `BlockPool`.
     pool: *mut BlockPool,
     capacity: usize,
+    #[allow(unused)]
     lowatermark: usize,
 
     // Used for NBR+ signal optimization
