@@ -2,17 +2,16 @@
 use nix::libc::{c_void, siginfo_t};
 use nix::sys::pthread::{pthread_kill, Pthread};
 use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-use setjmp::{sigjmp_buf, siglongjmp};
-use std::cell::RefCell;
-use std::mem::MaybeUninit;
-use std::sync::atomic::{compiler_fence, fence, AtomicBool, Ordering};
+use setjmp::{jmp_buf, sigjmp_buf, siglongjmp};
+use std::mem::{transmute, MaybeUninit};
+use std::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 static mut NEUTRALIZE_SIGNAL: Signal = Signal::SIGUSR1;
 static mut SIG_ACTION: MaybeUninit<SigAction> = MaybeUninit::uninit();
 
 thread_local! {
-    static JMP_BUF: RefCell<MaybeUninit<sigjmp_buf>> = RefCell::new(MaybeUninit::uninit());
-    static RESTARTABLE: AtomicBool = AtomicBool::new(false);
+    static JMP_BUF: Box<sigjmp_buf> = Box::new(unsafe { MaybeUninit::zeroed().assume_init() });
+    static RESTARTABLE: Box<AtomicBool> = Box::new(AtomicBool::new(false));
 }
 
 /// Install a process-wide signal handler.
@@ -40,23 +39,29 @@ pub(crate) unsafe fn send_signal(pthread: Pthread) -> nix::Result<()> {
     pthread_kill(pthread, NEUTRALIZE_SIGNAL)
 }
 
-#[inline]
-pub(crate) fn is_restartable() -> bool {
-    RESTARTABLE.with(|rest| rest.load(Ordering::Acquire))
+pub(crate) struct Status {
+    pub(crate) jmp_buf: *mut sigjmp_buf,
+    pub(crate) rest: &'static AtomicBool,
 }
 
-#[inline]
-pub(crate) fn set_restartable(set_rest: bool) {
-    // On the original paper, RESTARTABLE variable is modified by CAS.
-    // This is because, on x86 devices, CAS prevents instruction reordering
-    // so that additional memory fences are not necessary.
-    //
-    // However, a memory fence is needed
-    // in other environments with relaxed memory model.
-    // In this implementation, we use atomic storing and a fence
-    // instead of a single CAS.
-    RESTARTABLE.with(|rest| rest.store(set_rest, Ordering::Release));
-    fence(Ordering::SeqCst);
+impl Status {
+    #[inline]
+    pub unsafe fn new() -> Self {
+        Self {
+            jmp_buf: JMP_BUF.with(|buf| (&**buf as *const sigjmp_buf).cast_mut()),
+            rest: RESTARTABLE.with(|rest| transmute(&**rest)),
+        }
+    }
+
+    #[inline(always)]
+    pub fn set_restartable(&self) {
+        self.rest.store(true, Ordering::Relaxed);
+    }
+
+    #[inline(always)]
+    pub fn unset_restartable(&self) {
+        self.rest.store(false, Ordering::Relaxed);
+    }
 }
 
 /// Get a current neutralize signal.
@@ -69,6 +74,7 @@ pub(crate) fn set_restartable(set_rest: bool) {
 /// This function accesses and modify static variable.
 /// To avoid potential race conditions, do not
 /// call this function concurrently.
+#[inline]
 pub unsafe fn neutralize_signal() -> Signal {
     NEUTRALIZE_SIGNAL
 }
@@ -84,29 +90,31 @@ pub unsafe fn neutralize_signal() -> Signal {
 /// This function accesses and modify static variable.
 /// To avoid potential race conditions, do not
 /// call this function concurrently.
+#[inline]
 pub unsafe fn set_neutralize_signal(signal: Signal) {
     NEUTRALIZE_SIGNAL = signal;
 }
 
-/// Get a mutable thread-local pointer to `sigjmp_buf`,
-/// which is used for `sigsetjmp` at the entrance of
-/// read phase.
-///
-/// This function is used for `read_phase` macro and
-/// other internal functions.
-/// It is not recommended to access this manually.
 #[inline]
-pub fn jmp_buf() -> *mut sigjmp_buf {
-    JMP_BUF.with(|buf| buf.borrow_mut().as_mut_ptr())
+pub unsafe fn jmp_buf() -> *mut jmp_buf {
+    JMP_BUF.with(|buf| (&**buf as *const sigjmp_buf).cast_mut())
 }
 
 extern "C" fn handle_signal(_: i32, _: *mut siginfo_t, _: *mut c_void) {
-    if !is_restartable() {
+    let rest: &AtomicBool = match RESTARTABLE.try_with(|rest| unsafe { transmute(&**rest) }) {
+        Ok(rest) => rest,
+        Err(_) => return,
+    };
+
+    if !rest.load(Ordering::Relaxed) {
         return;
     }
 
-    let buf = JMP_BUF.with(|buf| buf.borrow_mut().as_mut_ptr());
-    set_restartable(false);
+    let buf = match JMP_BUF.try_with(|buf| (&**buf as *const sigjmp_buf).cast_mut()) {
+        Ok(buf) => buf,
+        Err(_) => return,
+    };
+    rest.store(false, Ordering::Relaxed);
     compiler_fence(Ordering::SeqCst);
 
     unsafe { siglongjmp(buf, 1) };

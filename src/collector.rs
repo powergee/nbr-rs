@@ -4,8 +4,10 @@ use atomic::Atomic;
 use nix::errno::Errno;
 use nix::sys::pthread::{pthread_self, Pthread};
 use rustc_hash::FxHashSet;
+use setjmp::jmp_buf;
 use static_assertions::const_assert;
-use std::sync::atomic::{compiler_fence, fence};
+use std::mem::zeroed;
+use std::sync::atomic::{compiler_fence, fence, AtomicBool};
 use std::sync::Barrier;
 use std::{
     cell::{Cell, RefCell},
@@ -14,10 +16,12 @@ use std::{
 };
 
 use crate::block_bag::{BlockBag, BlockPool, BLOCK_SIZE};
-use crate::recovery;
+use crate::recovery::{self, Status};
 use crate::stats;
 
 const_assert!(Atomic::<Pthread>::is_lock_free());
+
+const MAX_HAZPTR_COUNT: usize = 16;
 
 /// 0-indexed thread identifier.
 /// Note that this ThreadId is not same with pthread_t,
@@ -30,11 +34,6 @@ struct Thread {
     tid: ThreadId,
     // Retired records collected by a delete operation
     retired: *mut BlockBag,
-    // Saves the discovered records before upgrading to write
-    // to protect records from concurrent reclaimer threads.
-    // (Single-Writer Multi-Reader)
-    proposed_len: AtomicUsize,
-    proposed_hazptrs: Vec<AtomicPtr<u8>>,
     // Each reclaimer scans hazard pointers across threads
     // to free retired its bag such that any hazard pointers aren't freed.
     scanned_hazptrs: RefCell<FxHashSet<*mut u8>>,
@@ -59,27 +58,23 @@ struct Thread {
     saved_ts: Vec<usize>,
     first_lo_entry_flag: bool,
     retires_since_lo_watermark: usize,
+
+    // Saves the discovered records before upgrading to write
+    // to protect records from concurrent reclaimer threads.
+    // (Single-Writer Multi-Reader)
+    proposed_len: usize,
+    proposed_hazptrs: [AtomicPtr<u8>; MAX_HAZPTR_COUNT],
 }
 
 impl Thread {
-    pub fn new(
-        tid: usize,
-        num_threads: usize,
-        max_hazptr_per_thread: usize,
-        bag_cap_pow2: usize,
-        lowatermark: usize,
-    ) -> Self {
+    pub fn new(tid: usize, num_threads: usize, bag_cap_pow2: usize, lowatermark: usize) -> Self {
         let pool = Box::into_raw(Box::<BlockPool>::default());
-        let retired = Box::into_raw(Box::new(BlockBag::new(pool)));
-        let proposed_hazptrs = (0..max_hazptr_per_thread)
-            .map(|_| AtomicPtr::new(null_mut()))
-            .collect();
+        let retired: *mut BlockBag = Box::into_raw(Box::new(BlockBag::new(pool)));
+        let proposed_hazptrs = unsafe { zeroed() };
 
         Self {
             tid,
             retired,
-            proposed_len: AtomicUsize::new(0),
-            proposed_hazptrs,
             scanned_hazptrs: RefCell::default(),
             pool,
             capacity: bag_cap_pow2 / BLOCK_SIZE,
@@ -89,6 +84,8 @@ impl Thread {
             saved_ts: vec![0; num_threads],
             first_lo_entry_flag: true,
             retires_since_lo_watermark: 0,
+            proposed_len: 0,
+            proposed_hazptrs,
         }
     }
 
@@ -183,25 +180,12 @@ pub struct Collector {
 }
 
 impl Collector {
-    pub fn new(
-        num_threads: usize,
-        max_hazptr_per_thread: usize,
-        bag_cap_pow2: usize,
-        lowatermark: usize,
-    ) -> Self {
+    pub fn new(num_threads: usize, bag_cap_pow2: usize, lowatermark: usize) -> Self {
         assert!(bag_cap_pow2.count_ones() == 1);
         unsafe { recovery::install() };
 
         let threads = (0..num_threads)
-            .map(|tid| {
-                Thread::new(
-                    tid,
-                    num_threads,
-                    max_hazptr_per_thread,
-                    bag_cap_pow2,
-                    lowatermark,
-                )
-            })
+            .map(|tid| Thread::new(tid, num_threads, bag_cap_pow2, lowatermark))
             .collect();
 
         Self {
@@ -213,6 +197,7 @@ impl Collector {
         }
     }
 
+    #[cold]
     unsafe fn restart_all_threads(&self, reclaimer: ThreadId) -> Result<(), Errno> {
         for other_tid in 0..self.num_threads {
             if other_tid == reclaimer {
@@ -224,6 +209,7 @@ impl Collector {
         Ok(())
     }
 
+    #[cold]
     fn collect_all_saved_records(&self, reclaimer: ThreadId) {
         // Set where record would be collected in.
         let mut scanned = self.threads[reclaimer].scanned_hazptrs.borrow_mut();
@@ -231,8 +217,7 @@ impl Collector {
         fence(Ordering::SeqCst);
 
         for other_tid in 0..self.num_threads {
-            let len = self.threads[other_tid].proposed_len.load(Ordering::Acquire);
-            for i in 0..len {
+            for i in 0..MAX_HAZPTR_COUNT {
                 let hazptr = &self.threads[other_tid].proposed_hazptrs[i];
                 let ptr = hazptr.load(Ordering::Acquire);
                 scanned.insert(ptr);
@@ -255,10 +240,11 @@ impl Collector {
             "Attempted to exceed the maximum number of threads"
         );
         self.registered_map[tid].store(pthread_self(), Ordering::Release);
+        let guard = Guard::register(self, tid);
 
         // Wait until all threads are ready.
         self.barrier.wait();
-        Guard::register(self, tid)
+        guard
     }
 
     pub fn reset_registrations(&mut self) {
@@ -276,6 +262,7 @@ pub struct Guard {
     collector: *mut Collector,
     tid: ThreadId,
     retired_cnt_buff: Cell<usize>,
+    status: Status,
 }
 
 impl Guard {
@@ -284,6 +271,7 @@ impl Guard {
             collector: collector as *const _ as _,
             tid,
             retired_cnt_buff: Cell::new(0),
+            status: unsafe { Status::new() },
         }
     }
 
@@ -300,7 +288,7 @@ impl Guard {
     }
 
     #[inline]
-    fn is_unprotected(&self) -> bool {
+    pub fn is_unprotected(&self) -> bool {
         self.collector.is_null()
     }
 
@@ -340,39 +328,14 @@ impl Guard {
     /// as part of the read phase of some operation on the shared data
     /// structure. If the thread is neutralized in middle of its update
     /// to this local list, it might corrupt the structure of the list.
-    #[inline(never)]
+    #[inline]
     pub fn start_read(&self) {
-        if self.is_unprotected() {
-            return;
-        }
-
-        let thread = &mut self.coll_mut().threads[self.tid];
-        assert!(
-            !recovery::is_restartable(),
-            "restartable value should be false before starting read phase"
-        );
-
-        thread.proposed_len.store(0, Ordering::Release);
-        recovery::set_restartable(true);
+        self.status.set_restartable();
     }
 
-    /// Prevent other threads from deleting the record.
-    pub fn protect<T>(&self, ptr: *mut T) {
-        if self.is_unprotected() {
-            return;
-        }
-
-        let thread = self.thread_mut();
-        let hazptr_len = thread.proposed_len.load(Ordering::Acquire);
-        if hazptr_len == thread.proposed_hazptrs.len() {
-            panic!("The hazard pointer bag is already full.");
-        }
-        compiler_fence(Ordering::SeqCst);
-
-        thread.proposed_hazptrs[hazptr_len].store(ptr as *mut _, Ordering::Release);
-        compiler_fence(Ordering::SeqCst);
-
-        thread.proposed_len.store(hazptr_len + 1, Ordering::Release);
+    #[inline]
+    pub fn jmp_buf(&self) -> *mut jmp_buf {
+        self.status.jmp_buf
     }
 
     /// End read phase.
@@ -380,11 +343,7 @@ impl Guard {
     /// Note that it is also equivalent to upgrading to write phase.
     #[inline]
     pub fn end_read(&self) {
-        if self.is_unprotected() {
-            return;
-        }
-
-        recovery::set_restartable(false);
+        self.status.unset_restartable();
     }
 
     /// Retire a pointer.
@@ -482,6 +441,25 @@ impl Guard {
             self.flush_cnt_buff();
         }
     }
+
+    #[inline]
+    pub fn acquire_shield(&mut self) -> Option<Shield> {
+        let thread = self.thread_mut();
+        let len = thread.proposed_len;
+        thread.proposed_len += 1;
+        thread.proposed_hazptrs.get(len).map(|slot| Shield { slot })
+    }
+}
+
+pub struct Shield {
+    slot: *const AtomicPtr<u8>,
+}
+
+impl Shield {
+    #[inline(always)]
+    pub fn protect<T>(&self, ptr: *mut T) {
+        unsafe { &*self.slot }.store(ptr as _, Ordering::Relaxed);
+    }
 }
 
 /// Get a dummy `Guard` associated with no collector.
@@ -494,12 +472,17 @@ impl Guard {
 /// Use the unprotected `Guard` only if the data structure
 /// is not accessed concurrently.
 pub unsafe fn unprotected() -> &'static Guard {
+    static DUMMY_REST: AtomicBool = AtomicBool::new(false);
     struct GuardWrapper(Guard);
     unsafe impl Sync for GuardWrapper {}
     static UNPROTECTED: GuardWrapper = GuardWrapper(Guard {
         collector: null_mut(),
         tid: 0,
         retired_cnt_buff: Cell::new(0),
+        status: Status {
+            jmp_buf: null_mut(),
+            rest: &DUMMY_REST,
+        },
     });
     &UNPROTECTED.0
 }
@@ -521,7 +504,7 @@ mod tests {
 
     #[test]
     fn restart_all() {
-        let collector = Arc::new(Collector::new(THREADS + 1, 1, 256, 32));
+        let collector = Arc::new(Collector::new(THREADS + 1, 256, 32));
         let started = Arc::new(AtomicUsize::new(0));
 
         thread::scope(|s| {

@@ -5,7 +5,7 @@ mod collector;
 pub mod recovery;
 mod stats;
 
-pub use collector::{unprotected, Collector, Guard, ThreadId};
+pub use collector::{unprotected, Collector, Guard, Shield, ThreadId};
 pub use stats::count_garbages;
 
 pub use nix::sys::signal;
@@ -26,8 +26,8 @@ pub fn black_boxed_true() -> bool {
 /// it is not recommended to use this manually.
 #[macro_export]
 macro_rules! set_checkpoint {
-    () => {{
-        let buf = $crate::recovery::jmp_buf();
+    ($guard:expr) => {{
+        let buf = $guard.jmp_buf();
         if $crate::setjmp::sigsetjmp(buf, 0) == 1 {
             std::sync::atomic::fence(Ordering::SeqCst);
             let mut oldset = $crate::signal::SigSet::empty();
@@ -79,60 +79,49 @@ macro_rules! set_checkpoint {
 ///
 /// /* At this point, all _protecteei_ are protected. */
 /// ```
-///
-/// # HACK: "Why a dummy loop with `black_box` is used?"
-///
-/// It is not needed in normal builds, but
-/// when address-sanitizing, the address sanitizer often gives
-/// a false positive by recognizing `longjmp` as
-/// stack buffer overflow (or stack corruption).
-///
-/// However, awkwardly, if it wrapped by a loop block,
-/// it seems that the sanitizer recognizes `longjmp` as
-/// normal `continue` operation and totally satisfies with it.
-///
-/// So, they are added to avoid false positives from the sanitizer.
 #[macro_export]
 macro_rules! read_phase {
-    ($guard:expr; [$($record:expr),*] => $($t:tt)*) => {{
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-        loop {
-            // `sigsetjmp` must called first. (in `set_checkpoint!()`)
-            //
-            // Since, if `sigsetjmp` is done later than other jobs
-            // in `start_read`, the restartable would never be set to 1
-            // and the upgrade assert will fail.
-            //
-            // Also, it "must be inlined" because longjmp can only jump up
-            // the call stack, to functions that are still executing.
-            unsafe { $crate::set_checkpoint!() };
-            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-            ($guard).start_read();
-
-            // The body of read phase
-            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-            { $($t)* }
-            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-
-            $(
-                ($guard).protect($record);
-            )*
-            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-
-            // fence(SeqCst) is issued when `RESTARTABLE` is set to false
-            // in `end_read`.
-            ($guard).end_read();
-
-            if $crate::black_boxed_true() {
-                break;
-            }
-        }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-    }};
-
     ($guard:expr => $($t:tt)*) => {{
         std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
-        loop {
+        if cfg!(sanitize = "address") {
+            /// # HACK: "Why a dummy loop with `black_box` is used?"
+            ///
+            /// It is not needed in normal builds, but
+            /// when address-sanitizing, the address sanitizer often gives
+            /// a false positive by recognizing `longjmp` as
+            /// stack buffer overflow (or stack corruption).
+            ///
+            /// However, awkwardly, if it wrapped by a loop block,
+            /// it seems that the sanitizer recognizes `longjmp` as
+            /// normal `continue` operation and totally satisfies with it.
+            ///
+            /// So, they are added to avoid false positives from the sanitizer.
+            loop {
+                // `sigsetjmp` must called first. (in `set_checkpoint!()`)
+                //
+                // Since, if `sigsetjmp` is done later than other jobs
+                // in `start_read`, the restartable would never be set to 1
+                // and the upgrade assert will fail.
+                //
+                // Also, it "must be inlined" because longjmp can only jump up
+                // the call stack, to functions that are still executing.
+                unsafe { $crate::set_checkpoint!($guard) };
+                std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+                ($guard).start_read();
+
+                // The body of read phase
+                std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+                { $($t)* }
+                std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+
+                ($guard).end_read();
+                std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
+                if $crate::black_boxed_true() {
+                    break;
+                }
+            }
+        } else {
             // `sigsetjmp` must called first. (in `set_checkpoint!()`)
             //
             // Since, if `sigsetjmp` is done later than other jobs
@@ -141,23 +130,18 @@ macro_rules! read_phase {
             //
             // Also, it "must be inlined" because longjmp can only jump up
             // the call stack, to functions that are still executing.
-            unsafe { $crate::set_checkpoint!() };
+            unsafe { $crate::set_checkpoint!($guard) };
             std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
             ($guard).start_read();
 
             // The body of read phase
             std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
             { $($t)* }
-            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+            std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
 
-            // fence(SeqCst) is issued when `RESTARTABLE` is set to false
-            // in `end_read`.
             ($guard).end_read();
-
-            if $crate::black_boxed_true() {
-                break;
-            }
+            std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
         }
-        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+
     }};
 }
