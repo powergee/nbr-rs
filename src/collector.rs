@@ -6,7 +6,6 @@ use nix::sys::pthread::{pthread_self, Pthread};
 use rustc_hash::FxHashSet;
 use setjmp::jmp_buf;
 use static_assertions::const_assert;
-use std::mem::zeroed;
 use std::sync::atomic::{compiler_fence, fence, AtomicBool};
 use std::sync::Barrier;
 use std::{
@@ -76,8 +75,7 @@ impl Thread {
     ) -> Self {
         let pool = Box::into_raw(Box::<BlockPool>::default());
         let retired: *mut BlockBag = Box::into_raw(Box::new(BlockBag::new(pool)));
-        let mut proposed_hazptrs =
-            Vec::from(unsafe { zeroed::<[AtomicPtr<u8>; HAZARD_ARRAY_INIT_SIZE]>() });
+        let mut proposed_hazptrs = Vec::with_capacity(HAZARD_ARRAY_INIT_SIZE);
         proposed_hazptrs.resize_with(max_hazptrs, || AtomicPtr::new(null_mut()));
 
         Self {
