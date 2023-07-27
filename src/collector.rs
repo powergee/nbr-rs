@@ -21,7 +21,7 @@ use crate::stats;
 
 const_assert!(Atomic::<Pthread>::is_lock_free());
 
-const MAX_HAZPTR_COUNT: usize = 16;
+const HAZARD_ARRAY_INIT_SIZE: usize = 16;
 
 /// 0-indexed thread identifier.
 /// Note that this ThreadId is not same with pthread_t,
@@ -62,15 +62,23 @@ struct Thread {
     // Saves the discovered records before upgrading to write
     // to protect records from concurrent reclaimer threads.
     // (Single-Writer Multi-Reader)
-    proposed_len: usize,
-    proposed_hazptrs: [AtomicPtr<u8>; MAX_HAZPTR_COUNT],
+    using_hazptrs: usize,
+    proposed_hazptrs: Vec<AtomicPtr<u8>>,
 }
 
 impl Thread {
-    pub fn new(tid: usize, num_threads: usize, bag_cap_pow2: usize, lowatermark: usize) -> Self {
+    pub fn new(
+        tid: usize,
+        num_threads: usize,
+        bag_cap_pow2: usize,
+        lowatermark: usize,
+        max_hazptrs: usize,
+    ) -> Self {
         let pool = Box::into_raw(Box::<BlockPool>::default());
         let retired: *mut BlockBag = Box::into_raw(Box::new(BlockBag::new(pool)));
-        let proposed_hazptrs = unsafe { zeroed() };
+        let mut proposed_hazptrs =
+            Vec::from(unsafe { zeroed::<[AtomicPtr<u8>; HAZARD_ARRAY_INIT_SIZE]>() });
+        proposed_hazptrs.resize_with(max_hazptrs, || AtomicPtr::new(null_mut()));
 
         Self {
             tid,
@@ -84,7 +92,7 @@ impl Thread {
             saved_ts: vec![0; num_threads],
             first_lo_entry_flag: true,
             retires_since_lo_watermark: 0,
-            proposed_len: 0,
+            using_hazptrs: 0,
             proposed_hazptrs,
         }
     }
@@ -171,6 +179,7 @@ impl Drop for Thread {
 
 pub struct Collector {
     num_threads: usize,
+    max_hazptrs: usize,
     threads: Vec<Thread>,
     // Map from Thread ID into pthread_t(u64 or usize, which depends on platforms)
     // for each registered thread
@@ -180,16 +189,22 @@ pub struct Collector {
 }
 
 impl Collector {
-    pub fn new(num_threads: usize, bag_cap_pow2: usize, lowatermark: usize) -> Self {
+    pub fn new(
+        num_threads: usize,
+        bag_cap_pow2: usize,
+        lowatermark: usize,
+        max_hazptrs: usize,
+    ) -> Self {
         assert!(bag_cap_pow2.count_ones() == 1);
         unsafe { recovery::install() };
 
         let threads = (0..num_threads)
-            .map(|tid| Thread::new(tid, num_threads, bag_cap_pow2, lowatermark))
+            .map(|tid| Thread::new(tid, num_threads, bag_cap_pow2, lowatermark, max_hazptrs))
             .collect();
 
         Self {
             num_threads,
+            max_hazptrs,
             threads,
             registered_map: (0..num_threads).map(|_| Atomic::new(0)).collect(),
             registered_count: AtomicUsize::new(0),
@@ -217,7 +232,7 @@ impl Collector {
         fence(Ordering::SeqCst);
 
         for other_tid in 0..self.num_threads {
-            for i in 0..MAX_HAZPTR_COUNT {
+            for i in 0..self.max_hazptrs {
                 let hazptr = &self.threads[other_tid].proposed_hazptrs[i];
                 let ptr = hazptr.load(Ordering::Acquire);
                 scanned.insert(ptr);
@@ -445,8 +460,8 @@ impl Guard {
     #[inline]
     pub fn acquire_shield(&mut self) -> Option<Shield> {
         let thread = self.thread_mut();
-        let len = thread.proposed_len;
-        thread.proposed_len += 1;
+        let len = thread.using_hazptrs;
+        thread.using_hazptrs += 1;
         thread.proposed_hazptrs.get(len).map(|slot| Shield { slot })
     }
 }
@@ -504,7 +519,7 @@ mod tests {
 
     #[test]
     fn restart_all() {
-        let collector = Arc::new(Collector::new(THREADS + 1, 256, 32));
+        let collector = Arc::new(Collector::new(THREADS + 1, 256, 32, 16));
         let started = Arc::new(AtomicUsize::new(0));
 
         thread::scope(|s| {
