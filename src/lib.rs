@@ -1,5 +1,4 @@
 #![feature(cfg_sanitize)]
-#![feature(core_intrinsics)]
 mod block_bag;
 mod collector;
 pub mod recovery;
@@ -10,14 +9,6 @@ pub use stats::count_garbages;
 
 pub use nix::sys::signal;
 pub use setjmp;
-
-/// Returns a black-boxed true which a compiler
-/// doesn't optimize out.
-///
-/// For usage of this function, please refer to `read_phase`.
-pub fn black_boxed_true() -> bool {
-    core::intrinsics::black_box(true)
-}
 
 /// Make a checkpoint with `sigsetjmp` for
 /// recovering in read phase.
@@ -117,7 +108,7 @@ macro_rules! read_phase {
                 ($guard).end_read();
                 std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
 
-                if $crate::black_boxed_true() {
+                if std::hint::black_box(true) {
                     break;
                 }
             }
